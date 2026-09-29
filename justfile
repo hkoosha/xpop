@@ -26,7 +26,10 @@ run *args: build c
 build: c
   cargo build
 
-install:
+release: c
+  cargo build --release
+
+install: release
   sudo install -v \
     -g root -o root \
     ./target/release/xpop /usr/bin/xpop
