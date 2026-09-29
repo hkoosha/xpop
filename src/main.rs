@@ -608,13 +608,6 @@ mod x11 {
             };
         }
 
-        pub(crate) fn owns(
-            &self,
-            window: Window,
-        ) -> bool {
-            self.root == window
-        }
-
         pub(crate) fn conn_poll_fd(&self) -> BorrowedFd<'_> {
             return self.conn.as_fd();
         }
@@ -876,7 +869,9 @@ mod app {
                     -1
                 };
 
-                if dragons::poll(&mut fds, timeout, || !self.closed)? {
+                let timed_out =
+                    dragons::poll(&mut fds, timeout, || !self.closed)?;
+                if timed_out {
                     self.attach_client()?;
                     continue;
                 }
@@ -904,6 +899,10 @@ mod app {
                             log!(warn, "error processing dbus watch: {}", err);
                         }
                     }
+                }
+
+                if self.embedded.is_some() && self.x11.window.is_none() {
+                    self.attach_client()?;
                 }
             }
             Ok(())
@@ -940,12 +939,6 @@ mod app {
             let client = self.x11.window.as_ref().map(|client| client.window);
 
             match event {
-                Event::MapNotify(event)
-                    if self.x11.owns(event.event) && client.is_none() =>
-                {
-                    self.attach_client()?;
-                }
-
                 Event::MapNotify(event)
                     if self.x11.window().owns(event.window) =>
                 {
