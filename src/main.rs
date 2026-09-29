@@ -47,7 +47,7 @@ mod dragons {
         if ok != 0 {
             let err = io::Error::last_os_error();
             log!(fail, "libc::sigaction failure: {}", err);
-            return Err(err)?;
+            Err(err)?;
         };
 
         return Ok(());
@@ -79,7 +79,7 @@ mod dragons {
                     continue;
                 }
 
-                return Err(err)?;
+                Err(err)?;
             }
 
             break ok;
@@ -92,7 +92,7 @@ mod dragons {
         if unsafe { libc::kill(it, libc::SIGTERM) } != 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
-                return Err(err)?;
+                Err(err)?;
             }
         }
 
@@ -439,11 +439,8 @@ mod x11 {
 
             let raw = RawWindow::create(&conn, root, area, title)?;
 
-            let net_wm_pid = conn
-                .intern_atom(false, b"_NET_WM_PID")?
-                .reply()?
-                .clone()
-                .atom;
+            let net_wm_pid =
+                conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
 
             conn.flush()?;
 
@@ -813,7 +810,7 @@ mod app {
             else if pid < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() != Some(libc::ECHILD) {
-                    return Err(err)?;
+                    Err(err)?;
                 }
             }
 
@@ -885,19 +882,18 @@ mod app {
                     continue;
                 }
 
-                if x11_events & libc::POLLIN != 0 {
-                    if let Err(err) = self.process_x11_events() {
-                        log!(fail, "error processing X11 events: {}", err);
-                    }
+                if x11_events & libc::POLLIN != 0
+                    && let Err(err) = self.process_x11_events()
+                {
+                    log!(fail, "error processing X11 events: {}", err);
                 }
 
                 for (watch, pollfd) in watches.iter().zip(&fds[1..]) {
-                    if pollfd.revents != 0 {
-                        if let Err(err) =
+                    if pollfd.revents != 0
+                        && let Err(err) =
                             self.process_dbus_watch(watch.fd(), pollfd.revents)
-                        {
-                            log!(warn, "error processing dbus watch: {}", err);
-                        }
+                    {
+                        log!(warn, "error processing dbus watch: {}", err);
                     }
                 }
 
@@ -960,7 +956,6 @@ mod app {
                         self.focus_pending = true;
                         self.update_readiness()?;
                     }
-                    ();
                 }
 
                 Event::ConfigureNotify(event)
