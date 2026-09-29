@@ -4,24 +4,37 @@ use dbus::{
     Message,
     ffidisp::Connection as DBusConn,
 };
-use std::sync::atomic::Ordering;
-use x11rb::{
-    connection::Connection as _,
-    xcb_ffi::XCBConnection,
-};
 
 pub const NAMESPACE: &str = "io.koosha.xpop";
 
 #[clippy::format_args]
 macro_rules! log {
-    (info, $fmt:literal $($arg:tt)*) => {{ log!(@, ["INFO"], [$fmt], [$($arg)*]); }};
-    (warn, $fmt:literal $($arg:tt)*) => {{ log!(@, ["WARN"], [$fmt], [$($arg)*]); }};
-    (fail, $fmt:literal $($arg:tt)*) => {{ log!(@, ["FAIL"], [$fmt], [$($arg)*]); }};
-    ($fmt:literal $($arg:tt)*) => {{
-        if $crate::cfg::DEBUG.load(Ordering::Relaxed) { log!(@, ["DEBG"], [$fmt], [$($arg)*]); }
+    ($whom:ident@info $fmt:literal $($arg:tt)*) => {{ log!([INFO, $whom, $fmt], [$($arg)*]); }};
+    ($whom:ident@warn $fmt:literal $($arg:tt)*) => {{ log!([WARN, $whom, $fmt], [$($arg)*]); }};
+    ($whom:ident@fail $fmt:literal $($arg:tt)*) => {{ log!([FAIL, $whom, $fmt], [$($arg)*]); }};
+    ($whom:ident $fmt:literal $($arg:tt)*) => {{
+        if $crate::cfg::DEBUG.load(::std::sync::atomic::Ordering::SeqCst) {
+            log!([DBUG, $whom, $fmt], [$($arg)*]);
+        }
     }};
-    (@, [$level:literal], [$fmt:literal], [$($arg:tt)*]) => {{
-        eprintln!(concat!("[{}::", $level, "] ", $fmt), $crate::NAMESPACE $($arg)*);
+    ([$level:ident, $whom:ident, $fmt:literal], [$($arg:tt)*]) => {{
+         let d = ::std::time::SystemTime::now()
+            .duration_since(::std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        eprintln!(
+            concat!(
+                "[{:012}.{:03}] [{}::",
+                stringify!($level),
+                "::",
+                stringify!($whom),
+                "] ",
+                $fmt,
+            ),
+            d.as_secs(),
+            d.subsec_millis(),
+            $crate::NAMESPACE
+            $($arg)*
+        );
     }};
 }
 
@@ -37,6 +50,8 @@ mod dragons {
     extern "C" fn child_exited(_: libc::c_int) {}
 
     pub(crate) fn sigaction() -> Z {
+        log!(libc "sigaction...");
+
         let ok = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = child_exited as *const () as usize;
@@ -46,18 +61,23 @@ mod dragons {
 
         if ok != 0 {
             let err = io::Error::last_os_error();
-            log!(fail, "libc::sigaction failure: {}", err);
+            log!(libc@fail "sigaction failure: {}", err);
             Err(err)?;
         };
 
+        log!(libc "sigaction ok");
         return Ok(());
     }
 
     pub(crate) fn pgid(pid: libc::pid_t) -> Z<libc::pid_t> {
+        log!(libc "getting pgid of: {}", pid);
+
         return Ok(unsafe { libc::getpgid(pid) });
     }
 
     pub(crate) fn waitpid(pid: libc::pid_t) -> Z<(libc::pid_t, libc::c_int)> {
+        log!(libc "waiting gid: {}", pid);
+
         let mut status = 0;
         let wait = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         return Ok((wait, status));
@@ -68,6 +88,8 @@ mod dragons {
         timeout: i32,
         do_while: impl Fn() -> bool,
     ) -> Z<bool> {
+        log!(libc "polling fds: timeout={}, count={}", timeout, fds.len());
+
         let polled = loop {
             let ok = unsafe {
                 libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout)
@@ -76,12 +98,15 @@ mod dragons {
             if ok < 0 {
                 let err = io::Error::last_os_error();
                 if do_while() && err.raw_os_error() == Some(libc::EINTR) {
+                    log!(libc "interrupted poll, will retry: count={}", fds.len());
                     continue;
                 }
 
+                log!(libc "poll failed: {}", err);
                 Err(err)?;
             }
 
+            log!(libc "poll ended: {}", ok);
             break ok;
         };
 
@@ -89,9 +114,12 @@ mod dragons {
     }
 
     pub(crate) fn kill(it: libc::pid_t) -> Z {
+        log!(libc "killing pid: {}", it);
+
         if unsafe { libc::kill(it, libc::SIGTERM) } != 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
+                log!(libc "killing pid failed: pid={}, err={}", it, err);
                 Err(err)?;
             }
         }
@@ -101,7 +129,7 @@ mod dragons {
 
     pub(crate) fn try_kill(it: libc::pid_t) {
         if let Err(err) = kill(it) {
-            log!(warn, "could not kill: pid={}, error={}", it, err);
+            log!(libc@warn "could not kill: pid={}, error={}", it, err);
         }
     }
 
@@ -154,18 +182,18 @@ mod cfg {
     #[command(author, version, about)]
     pub(crate) struct Args {
         /// Send D-Bus signal to request visibility toggle and exit.
-        #[arg(short, long, conflicts_with_all = ["command", "list_monitors"])]
+        #[arg(short, long, conflicts_with_all = ["command"])]
         pub(crate) signal: bool,
-
-        /// Print the X11 root screen size and exit.
-        #[arg(long, conflicts_with_all = ["command", "signal"])]
-        pub(crate) list_monitors: bool,
 
         #[arg(short, long)]
         pub(crate) verbose: bool,
 
         /// The XORG app and its arguments to host.
-        #[arg(allow_hyphen_values = true, conflicts_with_all = ["list_monitors", "signal"], required_unless_present_any = ["signal", "list_monitors"], num_args = 1..
+        #[arg(
+            allow_hyphen_values = true,
+            conflicts_with_all = ["signal"],
+            required_unless_present_any = ["signal"],
+            num_args = 1..
         )]
         pub(crate) command: Vec<String>,
 
@@ -229,6 +257,9 @@ mod cfg {
         #[error("dbus signal error: {0}")]
         DBusSignal(String),
 
+        #[error("dbus signal send failure")]
+        DBusSend,
+
         #[error("no X11 screen")]
         NoScreen,
 
@@ -237,9 +268,6 @@ mod cfg {
 
         #[error("no command to run")]
         NoCommand,
-
-        #[error("no x11 client available")]
-        NoClient,
     }
 
     pub(crate) type Z<T = ()> = Result<T, MyError>;
@@ -289,12 +317,7 @@ mod x11 {
 
     pub(crate) struct EmbeddedProcess {
         pub(crate) pid: libc::pid_t,
-        pub(crate) process_group: libc::pid_t,
-    }
-
-    pub(crate) struct EmbeddedWindow {
-        pub(crate) ready: bool,
-        pub(crate) window: Window,
+        pub(crate) gid: libc::pid_t,
     }
 
     struct RawWindow {
@@ -309,11 +332,13 @@ mod x11 {
             area: Area,
             title: &str,
         ) -> Z<Self> {
+            log!(x11_window "generating window id...");
             let this = Self {
                 window: conn.generate_id()?,
                 area,
             };
 
+            log!(x11_window "creating window");
             conn.create_window(
                 x11rb::COPY_FROM_PARENT as u8,
                 this.window,
@@ -336,6 +361,7 @@ mod x11 {
             )?
             .check()?;
 
+            log!(x11_window "configuring window size");
             conn.configure_window(
                 this.window,
                 &ConfigureWindowAux::new()
@@ -346,6 +372,7 @@ mod x11 {
             )?
             .check()?;
 
+            log!(x11_window "setting window properties");
             conn.change_property8(
                 PropMode::REPLACE,
                 this.window,
@@ -357,6 +384,7 @@ mod x11 {
 
             conn.flush()?;
 
+            log!(x11_window "X11 window created");
             return Ok(this);
         }
 
@@ -413,52 +441,67 @@ mod x11 {
         root: Window,
         raw: RawWindow,
         pub(crate) process_group: Option<libc::pid_t>,
-        pub(crate) window: Option<EmbeddedWindow>,
+
+        pub(crate) ready: bool,
+        pub(crate) window: Option<Window>,
     }
 
     impl X11Host {
-        pub(crate) fn new(
-            area: Area,
+        pub(crate) fn open(
             title: &str,
+            get_area: impl FnOnce(u16, u16) -> Area,
         ) -> Z<Self> {
+            log!(x11 "acquiring xcb connection...");
             let (conn, screen_index) = XCBConnection::connect(None)?;
 
-            let root = conn
+            log!(x11 "acquiring xcb screen...");
+            let screen = conn
                 .setup()
                 .roots
                 .get(screen_index)
-                .ok_or(MyError::NoScreen)?
-                .root;
+                .ok_or(MyError::NoScreen)?;
 
+            log!(x11 "getting screen dimensions");
+            let area =
+                get_area(screen.width_in_pixels, screen.height_in_pixels);
+
+            log!(x11 "set root window attributes");
             conn.change_window_attributes(
-                root,
+                screen.root,
                 &ChangeWindowAttributesAux::new()
                     .event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
             )?
             .check()?;
 
-            let raw = RawWindow::create(&conn, root, area, title)?;
+            log!(x11 "creating raw window...");
+            let raw = RawWindow::create(&conn, screen.root, area, title)?;
 
             let net_wm_pid =
                 conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
 
             conn.flush()?;
 
-            Ok(Self {
+            let this = Self {
+                root: screen.root,
                 net_wm_pid,
-                root,
                 conn,
                 raw,
                 process_group: None,
                 window: None,
-            })
+                ready: false,
+            };
+
+            return Ok(this);
         }
 
-        pub(crate) fn find_mapped_client(&self) -> Z<Option<Window>> {
+        pub(crate) fn find_mapped_window(&self) -> Z<Option<Window>> {
+            log!(x11 "finding window...");
+
             let group = if let Some(it) = self.process_group {
                 it
             }
             else {
+                log!(x11 "missing pid");
                 return Ok(None);
             };
 
@@ -480,6 +523,39 @@ mod x11 {
             }
 
             Ok(None)
+        }
+
+        pub(crate) fn watch_window(
+            &self,
+            window: Window,
+        ) -> Z {
+            self.conn
+                .change_window_attributes(
+                    window,
+                    &ChangeWindowAttributesAux::new()
+                        .event_mask(EventMask::PROPERTY_CHANGE),
+                )?
+                .check()?;
+            return self.conn.flush().map_err(|it| it.into());
+        }
+
+        pub(crate) fn is_mapped_window(
+            &self,
+            window: Window,
+        ) -> Z<bool> {
+            let Some(group) = self.process_group
+            else {
+                return Ok(false);
+            };
+            return Ok(self.matches_process_group(window, group)
+                && self.is_viewable(window)?);
+        }
+
+        pub(crate) fn is_window_pid_property(
+            &self,
+            atom: Atom,
+        ) -> bool {
+            return atom == self.net_wm_pid;
         }
 
         fn matches_process_group(
@@ -531,37 +607,48 @@ mod x11 {
             self.conn
                 .reparent_window(window, self.raw.window, 0, 0)?
                 .check()?;
-            self.window = Some(EmbeddedWindow {
-                window,
-                ready: false,
-            });
-            self.resize_client(self.raw.area.width, self.raw.area.height)?;
-            self.map_client()?;
+            self.ready = false;
+            self.window = Some(window);
+            self.resize(self.raw.area.width, self.raw.area.height)?;
+            self.map_window()?;
             Ok(())
         }
 
-        pub(crate) fn map_client(&self) -> Z {
-            let Some(client) = self.window.as_ref()
+        pub(crate) fn map_window(&self) -> Z {
+            let Some(window) = self.window
             else {
                 return Ok(());
             };
-            self.conn.map_window(client.window)?.check()?;
+
+            self.conn.map_window(window)?.check()?;
             self.conn.flush()?;
+
             Ok(())
         }
 
-        pub(crate) fn resize_client(
+        pub(crate) fn request_redraw(&self) -> Z {
+            let Some(window) = self.window
+            else {
+                return Ok(());
+            };
+
+            self.conn.clear_area(true, window, 0, 0, 0, 0)?.check()?;
+            return self.conn.flush().map_err(|it| it.into());
+        }
+
+        pub(crate) fn resize(
             &mut self,
             width: u16,
             height: u16,
         ) -> Z {
-            let Some(client) = self.window.as_ref()
+            let Some(window) = self.window
             else {
                 return Ok(());
             };
+
             self.conn
                 .configure_window(
-                    client.window,
+                    window,
                     &ConfigureWindowAux::new()
                         .x(0)
                         .y(0)
@@ -575,26 +662,34 @@ mod x11 {
         }
 
         pub(crate) fn focus_window(&mut self) -> Z<bool> {
-            let Some(client) =
-                self.window.as_ref().filter(|client| client.ready)
+            if !self.ready {
+                return Ok(false);
+            }
+
+            let Some(window) = self.window
             else {
                 return Ok(false);
             };
-            if !self.is_viewable(client.window)? {
-                self.window.as_mut().expect("client vanished").ready = false;
+
+            if !self.is_viewable(window)? {
+                self.ready = false;
                 return Ok(false);
             }
-            if self.conn.get_input_focus()?.reply()?.focus == client.window {
+
+            if self.conn.get_input_focus()?.reply()?.focus == window {
                 return Ok(true);
             }
+
             self.conn
                 .set_input_focus(
                     InputFocus::PARENT,
-                    client.window,
+                    window,
                     x11rb::CURRENT_TIME,
                 )?
                 .check()?;
+
             self.conn.flush()?;
+
             Ok(true)
         }
 
@@ -603,6 +698,13 @@ mod x11 {
                 x11: self,
                 window: &self.raw,
             };
+        }
+
+        pub(crate) fn owns(
+            &self,
+            window: Window,
+        ) -> bool {
+            self.root == window
         }
 
         pub(crate) fn conn_poll_fd(&self) -> BorrowedFd<'_> {
@@ -664,15 +766,13 @@ mod app {
         io,
         os::unix::process::CommandExt as _,
         process::Command,
-        sync::atomic::Ordering,
         time::{
             Duration,
+            Instant,
             SystemTime,
         },
     };
-    use x11rb::connection::Connection;
     use x11rb::protocol::Event;
-    use x11rb::xcb_ffi::XCBConnection;
 
     use crate::{
         cfg::{
@@ -689,6 +789,11 @@ mod app {
         },
     };
 
+    struct Discovery {
+        deadline: Instant,
+        delay: Duration,
+    }
+
     pub(crate) struct Ctx {
         args: Args,
         x11: X11Host,
@@ -697,46 +802,55 @@ mod app {
         showing: bool,
         focus_pending: bool,
         last_toggle: SystemTime,
+        window_discovery: Option<Discovery>,
         embedded: Option<EmbeddedProcess>,
         closed: bool,
     }
 
     impl Ctx {
         const TOGGLE_COOL_DOWN_MILLIS: u128 = 40;
-        const CLIENT_DISCOVERY_INTERVAL_MILLIS: i32 = 25;
+        const DISCOVERY_INITIAL_DELAY: Duration = Duration::from_millis(100);
+        const DISCOVERY_MAX_DELAY: Duration = Duration::from_secs(1);
 
-        pub(crate) fn new(
-            args: Args,
-            dbus: DBusConn,
-        ) -> Z<Self> {
-            let area = {
-                let (conn, screen) = XCBConnection::connect(None)?;
-                Self::calc_area(
-                    &args,
-                    conn.setup().roots.get(screen).ok_or(MyError::NoScreen)?,
+        pub(crate) fn open(args: Args) -> Z<Self> {
+            log!(x11 "opening dbus connection");
+            let dbus = DBusConn::new_session()?;
+
+            log!(x11 "opening x11 connection");
+            let x11 = X11Host::open(&args.title, |width, height| {
+                Self::calc_area(&args, width, height)
+            })?;
+
+            let mut this = Self {
+                signal_rule: MatchRule::new_signal(
+                    &args.dbus_interface,
+                    &args.dbus_member,
                 )
-            };
-            let signal_rule =
-                MatchRule::new_signal(&args.dbus_interface, &args.dbus_member)
-                    .with_path(&args.dbus_path)
-                    .static_clone();
-            let x11 = X11Host::new(area, &args.title)?;
-            Ok(Self {
+                .with_path(&args.dbus_path)
+                .static_clone(),
+
                 showing: args.on_start == Behavior::Appear,
                 focus_pending: args.on_start == Behavior::Appear,
-                args,
-                x11,
-                dbus,
-                signal_rule,
+
                 last_toggle: SystemTime::UNIX_EPOCH,
+                window_discovery: None,
                 embedded: None,
                 closed: false,
-            })
+
+                dbus,
+                x11,
+                args,
+            };
+
+            this.start()?;
+
+            return Ok(this);
         }
 
         fn calc_area(
             args: &Args,
-            screen: &x11rb::protocol::xproto::Screen,
+            screen_width: u16,
+            screen_height: u16,
         ) -> Area {
             fn dimension(
                 value: &str,
@@ -757,17 +871,15 @@ mod app {
                 min(raw, limit).max(1) as u16
             }
 
-            let width = dimension(&args.width, screen.width_in_pixels);
-            let height = dimension(&args.height, screen.height_in_pixels);
             return Area {
                 x: args.x.min(i16::MAX as u32) as i16,
                 y: args.y.min(i16::MAX as u32) as i16,
-                width,
-                height,
+                width: dimension(&args.width, screen_width),
+                height: dimension(&args.height, screen_height),
             };
         }
 
-        pub(crate) fn start(&mut self) -> Z {
+        fn start(&mut self) -> Z {
             self.dbus.add_match(&self.signal_rule.match_str())?;
 
             if self.showing {
@@ -788,10 +900,9 @@ mod app {
             let pid = it.spawn()?.id() as libc::pid_t;
 
             self.x11.process_group = Some(pid);
-            self.embedded = Some(EmbeddedProcess {
-                pid,
-                process_group: pid,
-            });
+            self.embedded = Some(EmbeddedProcess { pid, gid: pid });
+
+            self.schedule_discovery();
 
             Ok(())
         }
@@ -857,19 +968,11 @@ mod app {
                 });
                 fds.extend(watches.iter().map(|watch| watch.to_pollfd()));
 
-                let discovery_pending =
-                    self.embedded.is_some() && self.x11.window.is_none();
-                let timeout = if discovery_pending {
-                    Self::CLIENT_DISCOVERY_INTERVAL_MILLIS
-                }
-                else {
-                    -1
-                };
-
+                let timeout = self.discovery_timeout();
                 let timed_out =
                     dragons::poll(&mut fds, timeout, || !self.closed)?;
                 if timed_out {
-                    self.attach_client()?;
+                    self.retry_discovery()?;
                     continue;
                 }
 
@@ -877,7 +980,7 @@ mod app {
                 if x11_events & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
                     != 0
                 {
-                    log!(info, "X11 connection closed");
+                    log!(ctx@info "X11 connection closed");
                     self.quit()?;
                     continue;
                 }
@@ -885,7 +988,7 @@ mod app {
                 if x11_events & libc::POLLIN != 0
                     && let Err(err) = self.process_x11_events()
                 {
-                    log!(fail, "error processing X11 events: {}", err);
+                    log!(ctx@fail "error processing X11 events: {}", err);
                 }
 
                 for (watch, pollfd) in watches.iter().zip(&fds[1..]) {
@@ -893,12 +996,8 @@ mod app {
                         && let Err(err) =
                             self.process_dbus_watch(watch.fd(), pollfd.revents)
                     {
-                        log!(warn, "error processing dbus watch: {}", err);
+                        log!(ctx@warn "error processing dbus watch: {}", err);
                     }
-                }
-
-                if self.embedded.is_some() && self.x11.window.is_none() {
-                    self.attach_client()?;
                 }
             }
             Ok(())
@@ -909,37 +1008,65 @@ mod app {
             status: i32,
         ) -> Z {
             if let Some(hosted) = self.embedded.take() {
-                log!(
-                    info,
+                log!(ctx@info
                     "hosted process exited status, pid={}, status={}",
                     hosted.pid,
                     status
                 );
-                dragons::try_kill(-hosted.process_group);
+                dragons::try_kill(-hosted.gid);
             }
             return self.quit();
         }
 
         fn process_x11_events(&mut self) -> Z {
-            loop {
-                if let Some(event) = self.x11.poll()? {
-                    self.process_x11_event(event)?;
-                };
+            while let Some(event) = self.x11.poll()? {
+                self.process_x11_event(event)?;
             }
+            return Ok(());
         }
 
         fn process_x11_event(
             &mut self,
             event: Event,
         ) -> Z {
-            let client = self.x11.window.as_ref().map(|client| client.window);
+            let window = self.x11.window;
 
             match event {
                 Event::MapNotify(event)
+                    if self.x11.owns(event.event)
+                        && !self.x11.window().owns(event.window)
+                        && window.is_none() =>
+                {
+                    self.attach_window(event.window)?;
+                }
+
+                Event::PropertyNotify(event)
+                    if window.is_none()
+                        && self.x11.is_window_pid_property(event.atom) =>
+                {
+                    self.attach_window(event.window)?;
+                }
+
+                Event::ReparentNotify(event)
+                    if window == Some(event.window)
+                        && !self.x11.window().owns(event.parent) =>
+                {
+                    log!(
+                        ctx@warn "embedded window was reparented away: window={:#x}, parent={:#x}",
+                        event.window,
+                        event.parent
+                    );
+                    self.x11.window = None;
+                    self.x11.ready = false;
+                    self.focus_pending = self.showing;
+                    self.schedule_discovery();
+                }
+
+                Event::MapNotify(event)
                     if self.x11.window().owns(event.window) =>
                 {
-                    self.sync_client_geometry()?;
-                    self.x11.map_client()?;
+                    self.sync_geometry()?;
+                    self.x11.map_window()?;
                     self.update_readiness()?;
                 }
 
@@ -963,36 +1090,39 @@ mod app {
                 {
                     self.x11.window().area().width = event.width;
                     self.x11.window().area().height = event.height;
-                    self.sync_client_geometry()?;
+                    self.sync_geometry()?;
                 }
 
-                Event::MapNotify(event) if client == Some(event.window) => {
-                    self.sync_client_geometry()?;
+                Event::MapNotify(event) if window == Some(event.window) => {
+                    self.sync_geometry()?;
                     self.update_readiness()?;
                 }
 
                 Event::ConfigureNotify(event)
-                    if client == Some(event.window) =>
+                    if window == Some(event.window) =>
                 {
                     if event.width != self.x11.window().area().width
                         || event.height != self.x11.window().area().height
                     {
-                        self.sync_client_geometry()?;
+                        self.sync_geometry()?;
                     }
                 }
 
-                Event::UnmapNotify(event) if client == Some(event.window) => {
-                    self.x11.window.as_mut().expect("client missing").ready =
-                        false;
+                Event::UnmapNotify(event) if window == Some(event.window) => {
+                    self.x11.ready = false;
+                    if self.showing {
+                        self.x11.map_window()?;
+                        self.update_readiness()?;
+                    }
                 }
 
-                Event::DestroyNotify(event) if client == Some(event.window) => {
-                    log!(
-                        info,
-                        "embedded X11 client was destroyed: {:#x}",
+                Event::DestroyNotify(event) if window == Some(event.window) => {
+                    log!(ctx@info
+                        "embedded X11 window was destroyed: {:#x}",
                         event.window
                     );
                     self.x11.window = None;
+                    self.schedule_discovery();
                 }
 
                 _ => {}
@@ -1001,44 +1131,104 @@ mod app {
             return Ok(());
         }
 
-        fn sync_client_geometry(&mut self) -> Z {
-            return self.x11.resize_client(
+        fn sync_geometry(&mut self) -> Z {
+            return self.x11.resize(
                 self.x11.window().area().width,
                 self.x11.window().area().height,
             );
         }
 
-        fn attach_client(&mut self) -> Z {
-            log!("attaching client");
+        fn schedule_discovery(&mut self) {
+            if self.x11.window.is_none() && self.window_discovery.is_none() {
+                self.window_discovery = Some(Discovery {
+                    deadline: Instant::now() + Self::DISCOVERY_INITIAL_DELAY,
+                    delay: Self::DISCOVERY_INITIAL_DELAY,
+                });
+            }
+        }
 
-            if let Some(window) = self.x11.find_mapped_client()? {
-                self.x11.embed(window)?;
-                self.update_readiness()?;
+        fn discovery_timeout(&self) -> i32 {
+            let Some(discovery) = self.window_discovery.as_ref()
+            else {
+                return -1;
+            };
+            let millis = discovery
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .max(1);
+            return i32::try_from(millis).unwrap_or(i32::MAX);
+        }
+
+        fn retry_discovery(&mut self) -> Z {
+            let Some(discovery) = self.window_discovery.take()
+            else {
+                return Ok(());
+            };
+
+            self.attach()?;
+            if self.x11.window.is_none() {
+                let delay = min(
+                    discovery.delay.saturating_mul(2),
+                    Self::DISCOVERY_MAX_DELAY,
+                );
+                self.window_discovery = Some(Discovery {
+                    deadline: Instant::now() + delay,
+                    delay,
+                });
+            }
+            return Ok(());
+        }
+
+        fn attach(&mut self) -> Z {
+            log!(ctx "attaching window");
+
+            if let Some(window) = self.x11.find_mapped_window()? {
+                self.embed(window)?;
             }
 
             return Ok(());
+        }
+
+        fn attach_window(
+            &mut self,
+            window: x11rb::protocol::xproto::Window,
+        ) -> Z {
+            self.x11.watch_window(window)?;
+            if self.x11.is_mapped_window(window)? {
+                self.embed(window)?;
+            }
+            return Ok(());
+        }
+
+        fn embed(
+            &mut self,
+            window: x11rb::protocol::xproto::Window,
+        ) -> Z {
+            self.x11.embed(window)?;
+            self.window_discovery = None;
+            if self.showing {
+                self.x11.request_redraw()?;
+            }
+            return self.update_readiness();
         }
 
         fn update_readiness(&mut self) -> Z {
             let ready = self
                 .x11
                 .window
-                .as_ref()
-                .map(|client| client.window)
                 .map(|window| self.x11.is_viewable(window))
                 .transpose()?;
 
-            let ready = match ready {
+            self.x11.ready = match ready {
                 None => return Ok(()),
                 Some(it) => it,
             };
 
-            self.x11.window.as_mut().ok_or(MyError::NoClient)?.ready = ready;
-
-            if ready {
+            if self.x11.ready {
                 if !self.showing || !self.focus_pending {
                     log!(
-                        "not ready yet, cannot focus, showing={}, focus_pending={}",
+                        ctx "ready but focus is not requested: showing={}, focus_pending={}",
                         self.showing,
                         self.focus_pending
                     );
@@ -1064,7 +1254,11 @@ mod app {
             }
             else {
                 self.x11.window().show()?;
-                self.x11.map_client()?;
+                if self.x11.window.is_none() {
+                    self.attach()?;
+                }
+                self.x11.map_window()?;
+                self.x11.request_redraw()?;
                 self.x11.window().focus()
             }
         }
@@ -1091,7 +1285,7 @@ mod app {
             self.closed = true;
 
             if let Some(hosted) = self.embedded.take() {
-                dragons::try_kill(-hosted.process_group);
+                dragons::try_kill(-hosted.gid);
             }
 
             self.x11.window().destroy()?;
@@ -1112,10 +1306,13 @@ use crate::{
 
 fn main() -> Z {
     let it: Args = cfg::args_or_exit();
+    cfg::DEBUG.store(it.verbose, std::sync::atomic::Ordering::SeqCst);
 
-    cfg::DEBUG.store(it.verbose, Ordering::Relaxed);
+    log!(main "BEGIN");
 
     if it.signal {
+        log!(main "doing signal and quit");
+
         return DBusConn::new_session()?
             .send(
                 Message::new_signal(
@@ -1126,22 +1323,25 @@ fn main() -> Z {
                 .map_err(MyError::DBusSignal)?,
             )
             .map(|_| ())
-            .map_err(|_| MyError::DBusSignal("could not send signal".into()));
-    }
-
-    if it.list_monitors {
-        let (conn, screen) = XCBConnection::connect(None)?;
-        let screen = conn.setup().roots.get(screen).ok_or(MyError::NoScreen)?;
-        println!("0 - {}x{}", screen.width_in_pixels, screen.height_in_pixels);
-        return Ok(());
+            .map_err(|_| MyError::DBusSend);
     }
 
     dragons::sigaction()?;
 
-    let dbus = DBusConn::new_session()?;
-    let mut ctx = Ctx::new(it, dbus)?;
-    ctx.start()?;
+    log!(main "opening context...");
+    let mut ctx = Ctx::open(it)?;
+
+    log!(main "main loop reached");
     let result = ctx.run();
+
+    log!(main "will quit");
     ctx.quit()?;
-    result
+
+    log!(main "fin");
+    match result.as_ref() {
+        Ok(_) => log!(main "END: ok"),
+        Err(err) => log!(main "END: failed: {}", err),
+    }
+
+    return result;
 }
