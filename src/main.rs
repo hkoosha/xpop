@@ -236,7 +236,6 @@ mod dragons {
 }
 
 mod errors {
-    use std::error::Error;
     use std::io;
 
     use x11rb::errors::{
@@ -282,14 +281,21 @@ mod errors {
     pub(crate) type Z<T = ()> = Result<T, MyError>;
 
     #[allow(unused, dead_code)]
-    pub(crate) trait ErrorLogger: Sized + Error {
-        fn and_log(self) -> Self {
-            log!(unexpected@fail "unexpected error: {}", self);
-            return self;
-        }
+    pub(crate) trait ErrorLogger: Sized {
+        fn and_log(self) -> Self;
     }
 
-    impl ErrorLogger for MyError {}
+    impl<T> ErrorLogger for Result<T, MyError> {
+        fn and_log(self) -> Self {
+            match self {
+                Ok(it) => Ok(it),
+                Err(err) => {
+                    log!(unexpected@fail "unexpected error: {}", err);
+                    return Err(err);
+                }
+            }
+        }
+    }
 }
 
 mod cfg {
@@ -734,22 +740,21 @@ mod x11 {
             &self,
             window: Window,
         ) -> Z {
-            self.x11
-                .get()
-                .conn
-                .change_window_attributes(
-                    window,
-                    &ChangeWindowAttributesAux::new()
-                        .override_redirect(1u32)
-                        .event_mask(EventMask::STRUCTURE_NOTIFY),
-                )?
-                .check()?;
+            let conn = &self.x11.get().conn;
 
-            self.x11
-                .get()
-                .conn
-                .reparent_window(window, self.window, 0, 0)?
-                .check()?;
+            // ReparentWindow automatically remaps an already mapped client.
+            // Unmap first so the explicit map after resize can generate Expose.
+            conn.unmap_window(window)?.check()?;
+
+            conn.change_window_attributes(
+                window,
+                &ChangeWindowAttributesAux::new()
+                    .override_redirect(1u32)
+                    .event_mask(EventMask::STRUCTURE_NOTIFY),
+            )?
+            .check()?;
+
+            conn.reparent_window(window, self.window, 0, 0)?.check()?;
 
             self.raise()?;
 
@@ -985,150 +990,66 @@ mod app {
         const DISCOVERY_INITIAL_DELAY: Duration = Duration::from_millis(100);
         const DISCOVERY_MAX_DELAY: Duration = Duration::from_secs(1);
 
-        pub(crate) fn run(&mut self) -> Z {
+        pub(crate) fn looper(&mut self) -> Z {
             while !self.closed {
-                self.reap_hosted()?;
-                if self.closed {
-                    continue;
-                }
+                self.ekran()?;
+            }
 
-                let watches = self.dbus.watch_fds();
-                let mut fds = Vec::with_capacity(watches.len() + 1);
-                fds.push(libc::pollfd {
-                    fd: self.x11.get().conn_poll_fd().as_raw_fd(),
-                    events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
-                    revents: 0,
-                });
-                fds.extend(watches.iter().map(|watch| watch.to_pollfd()));
+            Ok(())
+        }
 
-                let timeout = self.discovery_timeout();
-                let timed_out =
-                    dragons::poll(&mut fds, timeout, || !self.closed)?;
-                if timed_out {
-                    self.retry_discovery()?;
-                    continue;
-                }
+        pub(crate) fn ekran(&mut self) -> Z {
+            log!(ekran "reap hosted");
+            self.reap_hosted()?;
+            if self.closed {
+                return Ok(());
+            }
 
-                let x11_events = fds[0].revents;
-                if x11_events & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
-                    != 0
-                {
-                    log!(ctx@info "X11 connection closed");
-                    self.quit()?;
-                    continue;
-                }
+            log!(ekran "watch fds");
+            let watches = self.dbus.watch_fds();
+            let mut fds = Vec::with_capacity(watches.len() + 1);
+            fds.push(libc::pollfd {
+                fd: self.x11.get().conn_poll_fd().as_raw_fd(),
+                events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+                revents: 0,
+            });
+            fds.extend(watches.iter().map(|watch| watch.to_pollfd()));
 
-                if x11_events & libc::POLLIN != 0
-                    && let Err(err) = self.process_x11_events()
-                {
-                    log!(ctx@fail "error processing X11 events: {}", err);
-                }
+            log!(ekran "poll...");
+            let timeout = self.discovery_timeout();
+            let timed_out = dragons::poll(&mut fds, timeout, || !self.closed)?;
+            if timed_out {
+                log!(ekran "retry discovery on poll timeout");
+                self.retry_discovery()?;
+                return Ok(());
+            }
 
-                for (watch, pollfd) in watches.iter().zip(&fds[1..]) {
-                    if pollfd.revents != 0
-                        && let Err(err) =
-                            self.process_dbus_watch(watch.fd(), pollfd.revents)
-                    {
-                        log!(ctx@warn "error processing dbus watch: {}", err);
+            let mask = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+            if fds[0].revents & mask != 0 {
+                log!(ekran@info "X11 connection closed");
+                self.quit()?;
+                return Ok(());
+            }
+
+            if (fds[0].revents & libc::POLLIN) != 0 {
+                let x11 = self.x11.clone();
+                while let Some(event) = x11.get().poll()? {
+                    if let Err(err) = self.process_x11_event(event) {
+                        log!(ekran@fail "error processing X11 events: {}", err);
+                        break;
                     }
                 }
             }
-            Ok(())
-        }
 
-        fn start(&mut self) -> Z {
-            self.dbus.add_match(&self.signal_rule.match_str())?;
-
-            if self.showing {
-                self.host.show()?;
-                self.host.focus()?;
-            }
-
-            let mut it = Command::new(
-                self.args.command.first().ok_or(MyError::NoCommand)?,
-            );
-            it.args(&self.args.command[1..]).process_group(0);
-            dragons::pre_exec(&mut it);
-
-            if let Some(dir) = self.args.working_dir.as_ref() {
-                it.current_dir(dir);
-            }
-
-            let pid = it.spawn()?.id() as libc::pid_t;
-
-            self.process_group = Some(pid);
-            self.process = Some(EmbeddedProcess { pid, gid: pid });
-
-            self.schedule_discovery();
-
-            Ok(())
-        }
-
-        fn reap_hosted(&mut self) -> Z {
-            let Some(hosted) = self.process.as_ref()
-            else {
-                return Ok(());
-            };
-
-            let (pid, status) = dragons::waitpid(hosted.pid)?;
-
-            if pid == hosted.pid {
-                self.on_child_exit(status)?;
-            }
-            else if pid < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ECHILD) {
-                    Err(err)?;
-                }
-            }
-
-            return Ok(());
-        }
-
-        fn process_dbus_watch(
-            &mut self,
-            fd: libc::c_int,
-            revents: libc::c_short,
-        ) -> Z {
-            let mut should_toggle = false;
-            for item in self
-                .dbus
-                .watch_handle(fd, WatchEvent::from_revents(revents))
-            {
-                if let ConnectionItem::Signal(message) = item
-                    && self.signal_rule.matches(&message)
+            for (watch, pollfd) in watches.iter().zip(&fds[1..]) {
+                if pollfd.revents != 0
+                    && let Err(err) =
+                        self.process_dbus_watch(watch.fd(), pollfd.revents)
                 {
-                    should_toggle = true;
+                    log!(ekran@warn "error processing dbus watch: {}", err);
                 }
             }
 
-            if should_toggle {
-                self.toggle()?;
-            }
-
-            return Ok(());
-        }
-
-        fn on_child_exit(
-            &mut self,
-            status: i32,
-        ) -> Z {
-            if let Some(hosted) = self.process.take() {
-                log!(ctx@info
-                    "hosted process exited status, pid={}, status={}",
-                    hosted.pid,
-                    status
-                );
-                dragons::try_kill(-hosted.gid);
-            }
-            return self.quit();
-        }
-
-        fn process_x11_events(&mut self) -> Z {
-            let x11 = self.x11.clone();
-            while let Some(event) = x11.get().poll()? {
-                self.process_x11_event(event)?;
-            }
             return Ok(());
         }
 
@@ -1136,6 +1057,8 @@ mod app {
             &mut self,
             event: Event,
         ) -> Z {
+            log!(ekran "x11 event: {:?}", event);
+
             match event {
                 Event::MapNotify(event)
                     if self.x11.get().root_is(event.event)
@@ -1231,6 +1154,94 @@ mod app {
             }
 
             return Ok(());
+        }
+
+        fn start(&mut self) -> Z {
+            self.dbus.add_match(&self.signal_rule.match_str())?;
+
+            if self.showing {
+                self.host.show()?;
+                self.host.focus()?;
+            }
+
+            let mut it = Command::new(
+                self.args.command.first().ok_or(MyError::NoCommand)?,
+            );
+            it.args(&self.args.command[1..]).process_group(0);
+            dragons::pre_exec(&mut it);
+
+            if let Some(dir) = self.args.working_dir.as_ref() {
+                it.current_dir(dir);
+            }
+
+            let pid = it.spawn()?.id() as libc::pid_t;
+
+            self.process_group = Some(pid);
+            self.process = Some(EmbeddedProcess { pid, gid: pid });
+
+            self.schedule_discovery();
+
+            Ok(())
+        }
+
+        fn reap_hosted(&mut self) -> Z {
+            let Some(hosted) = self.process.as_ref()
+            else {
+                return Ok(());
+            };
+
+            let (pid, status) = dragons::waitpid(hosted.pid)?;
+
+            if pid == hosted.pid {
+                self.on_child_exit(status)?;
+            }
+            else if pid < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ECHILD) {
+                    Err(err)?;
+                }
+            }
+
+            return Ok(());
+        }
+
+        fn process_dbus_watch(
+            &mut self,
+            fd: libc::c_int,
+            revents: libc::c_short,
+        ) -> Z {
+            let mut should_toggle = false;
+            for item in self
+                .dbus
+                .watch_handle(fd, WatchEvent::from_revents(revents))
+            {
+                if let ConnectionItem::Signal(message) = item
+                    && self.signal_rule.matches(&message)
+                {
+                    should_toggle = true;
+                }
+            }
+
+            if should_toggle {
+                self.toggle()?;
+            }
+
+            return Ok(());
+        }
+
+        fn on_child_exit(
+            &mut self,
+            status: i32,
+        ) -> Z {
+            if let Some(hosted) = self.process.take() {
+                log!(ctx@info
+                    "hosted process exited status, pid={}, status={}",
+                    hosted.pid,
+                    status
+                );
+                dragons::try_kill(-hosted.gid);
+            }
+            return self.quit();
         }
 
         fn schedule_discovery(&mut self) {
@@ -1462,6 +1473,7 @@ mod app {
     }
 }
 
+use crate::errors::ErrorLogger;
 use crate::{
     app::open_context,
     cfg::Args,
@@ -1504,16 +1516,11 @@ fn main() -> Z {
     let mut ctx = open_context(it)?;
 
     log!(main "main loop reached");
-    let result = ctx.run();
+    let result = ctx.looper().and_log();
 
     log!(main "will quit");
     ctx.quit()?;
 
     log!(main "fin");
-    match result.as_ref() {
-        Ok(_) => log!(main "END: ok"),
-        Err(err) => log!(main "END: failed: {}", err),
-    }
-
     return result;
 }
