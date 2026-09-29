@@ -4,7 +4,6 @@ use dbus::{
     Message,
     ffidisp::Connection as DBusConn,
 };
-use std::time::Duration;
 
 pub const NAMESPACE: &str = "io.koosha.xpop";
 
@@ -78,11 +77,6 @@ impl<T> O<T> {
     }
 }
 
-#[allow(dead_code, unused)]
-pub(crate) fn sleep() {
-    std::thread::sleep(Duration::from_millis(1000));
-}
-
 #[clippy::format_args]
 macro_rules! log {
     ($whom:ident@info $fmt:literal $($arg:tt)*) => {{ log!([INFO, $whom, $fmt], [$($arg)*]); }};
@@ -126,110 +120,124 @@ mod dragons {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
-    use crate::Z;
-
     extern "C" fn child_exited(_: libc::c_int) {}
 
-    pub(crate) fn sigaction() -> Z {
+    pub(crate) fn sigaction() -> io::Result<()> {
         log!(libc@trac "sigaction...");
 
-        let ok = unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = child_exited as *const () as usize;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut())
-        };
+        // SAFETY: Linux sigaction's integer/mask fields accept zero, and its
+        // optional restorer becomes None. The callback uses the required C ABI.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = child_exited as *const () as usize;
 
-        if ok != 0 {
-            let err = io::Error::last_os_error();
-            log!(libc@fail "sigaction failure: {}", err);
-            Err(err)?;
-        };
+        // SAFETY: sa_mask is writable, aligned, and live for the entire call.
+        if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: SIGCHLD is catchable, action is initialized, and a null old
+        // action is permitted. The handler performs no non-signal-safe work.
+        if unsafe {
+            libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut())
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
 
         log!(libc@trac "sigaction ok");
         return Ok(());
     }
 
-    pub(crate) fn pgid(pid: libc::pid_t) -> Z<libc::pid_t> {
+    pub(crate) fn pgid(pid: libc::pid_t) -> io::Result<libc::pid_t> {
+        if pid <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process lookup requires a positive PID",
+            ));
+        }
         log!(libc@trac "getting pgid of: {}", pid);
 
-        return Ok(unsafe { libc::getpgid(pid) });
-    }
-
-    pub(crate) fn waitpid(pid: libc::pid_t) -> Z<(libc::pid_t, libc::c_int)> {
-        log!(libc@trac "waiting gid: {}", pid);
-
-        let mut status = 0;
-        let wait = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        return Ok((wait, status));
+        // SAFETY: getpgid takes no pointers. A positive PID selects one process.
+        let group = unsafe { libc::getpgid(pid) };
+        if group == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(group);
     }
 
     pub(crate) fn poll(
-        fds: &mut Vec<pollfd>,
+        fds: &mut [pollfd],
         timeout: i32,
-        do_while: impl Fn() -> bool,
-    ) -> Z<bool> {
+    ) -> io::Result<bool> {
+        let count = libc::nfds_t::try_from(fds.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many poll descriptors",
+            )
+        })?;
         log!(libc@trac "polling fds: timeout={}, count={}", timeout, fds.len());
 
-        let polled = loop {
-            let ok = unsafe {
-                libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout)
-            };
+        // SAFETY: the exclusive slice provides count initialized pollfd entries;
+        // its storage cannot move during this call. A zero count permits an empty slice.
+        let polled = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) };
+        if polled < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if fds.iter().any(|fd| fd.revents & libc::POLLNVAL != 0) {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
 
-            if ok < 0 {
-                let err = io::Error::last_os_error();
-                if do_while() && err.raw_os_error() == Some(libc::EINTR) {
-                    log!(libc@trac "interrupted poll, will retry: count={}", fds.len());
-                    continue;
-                }
-
-                log!(libc@trac "poll failed: {}", err);
-                Err(err)?;
-            }
-
-            log!(libc@trac "poll ended: {}", ok);
-            break ok;
-        };
-
+        log!(libc@trac "poll ended: {}", polled);
         return Ok(polled == 0);
     }
 
-    pub(crate) fn kill(it: libc::pid_t) -> Z {
-        log!(libc@trac "killing pid: {}", it);
-
-        if unsafe { libc::kill(it, libc::SIGTERM) } != 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::ESRCH) {
-                log!(libc@trac "killing pid failed: pid={}, err={}", it, err);
-                Err(err)?;
-            }
+    pub(crate) fn kill_group(gid: libc::pid_t) -> io::Result<()> {
+        if gid <= 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process-group termination requires a PGID greater than one",
+            ));
         }
+        log!(libc@trac "killing process group: {}", gid);
 
+        // SAFETY: gid > 1 makes negation safe and excludes kill's special 0/-1
+        // selectors. SIGTERM is valid; permission and existence errors are checked.
+        if unsafe { libc::kill(-gid, libc::SIGTERM) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         return Ok(());
     }
 
-    pub(crate) fn try_kill(it: libc::pid_t) {
-        if let Err(err) = kill(it) {
-            log!(libc@warn "could not kill: pid={}, error={}", it, err);
+    pub(crate) fn try_kill_group(gid: libc::pid_t) {
+        if let Err(err) = kill_group(gid)
+            && err.raw_os_error() != Some(libc::ESRCH)
+        {
+            log!(libc@warn "could not kill process group: gid={}, error={}", gid, err);
         }
     }
 
     pub(crate) fn pre_exec(it: &mut Command) {
-        unsafe {
-            it.pre_exec(|| {
-                let parent = libc::getppid();
+        let parent = std::process::id();
 
-                return if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM)
-                    != 0
+        // SAFETY: the hook captures only a PID and uses libc calls and raw OS
+        // errors after fork: no allocation, locks, logging, or unwinding. prctl's
+        // variadic arguments have unsigned-long width, including unused zeros.
+        unsafe {
+            it.pre_exec(move || {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGTERM as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) == -1
                 {
-                    Err(io::Error::last_os_error())
+                    return Err(io::Error::last_os_error());
                 }
-                else if libc::getppid() != parent {
-                    Err(io::Error::from_raw_os_error(libc::ESRCH))
+                if u32::try_from(libc::getppid()).ok() != Some(parent) {
+                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
                 }
-                else {
-                    Ok(())
-                };
+                return Ok(());
             });
         }
     }
@@ -271,7 +279,7 @@ mod errors {
         #[error("no X11 screen")]
         NoScreen,
 
-        #[error("io error")]
+        #[error("io error: {0}")]
         Io(#[from] io::Error),
 
         #[error("no command to run")]
@@ -280,7 +288,6 @@ mod errors {
 
     pub(crate) type Z<T = ()> = Result<T, MyError>;
 
-    #[allow(unused, dead_code)]
     pub(crate) trait ErrorLogger: Sized {
         fn and_log(self) -> Self;
     }
@@ -411,7 +418,10 @@ mod x11 {
                 WindowClass,
             },
         },
-        wrapper::ConnectionExt,
+        wrapper::{
+            ConnectionExt,
+            GrabServer,
+        },
         xcb_ffi::XCBConnection,
     };
 
@@ -448,7 +458,7 @@ mod x11 {
                     }
 
                     pending.push_back(window);
-                    if self.matches_process_group(window, gid)
+                    if self.matches_process_group(window, gid)?
                         && self.is_viewable(window)?
                     {
                         return Ok(Some(window));
@@ -479,7 +489,7 @@ mod x11 {
             window: Window,
             gid: libc::pid_t,
         ) -> Z<bool> {
-            return Ok(self.matches_process_group(window, gid)
+            return Ok(self.matches_process_group(window, gid)?
                 && self.is_viewable(window)?);
         }
 
@@ -494,8 +504,9 @@ mod x11 {
             &self,
             window: Window,
             group: libc::pid_t,
-        ) -> bool {
-            self.conn
+        ) -> Z<bool> {
+            let pid = self
+                .conn
                 .get_property(
                     false,
                     window,
@@ -509,10 +520,20 @@ mod x11 {
                 .and_then(|reply| {
                     reply.value32().and_then(|mut values| values.next())
                 })
-                .map(|pid| pid as libc::pid_t)
-                .is_some_and(|pid| {
-                    dragons::pgid(pid).is_ok_and(|pgid| pgid == group)
-                })
+                .and_then(|pid| libc::pid_t::try_from(pid).ok())
+                .filter(|pid| *pid > 0);
+            let Some(pid) = pid
+            else {
+                return Ok(false);
+            };
+
+            match dragons::pgid(pid) {
+                Ok(actual) => Ok(actual == group),
+                Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {
+                    Ok(false)
+                }
+                Err(err) => Err(err.into()),
+            }
         }
 
         fn is_viewable(
@@ -532,6 +553,15 @@ mod x11 {
             return self.conn.poll_for_event().map_err(MyError::X11Connection);
         }
 
+        pub(crate) fn grab_server(&self) -> Z<GrabServer<'_, XCBConnection>> {
+            return Ok(GrabServer::grab(&self.conn)?);
+        }
+
+        pub(crate) fn flush(&self) -> Z {
+            self.conn.flush()?;
+            return Ok(());
+        }
+
         pub(crate) fn root_is(
             &self,
             window: Window,
@@ -543,7 +573,6 @@ mod x11 {
     pub(crate) struct EmbeddedWindowMan {
         x11: R<X11Host>,
         ready: R<bool>,
-        pending_focus: R<bool>,
         embedded_win: O<Window>,
     }
 
@@ -551,7 +580,7 @@ mod x11 {
         pub(crate) fn map_window(&self) -> Z {
             let Some(window) = *self.embedded_win.read()
             else {
-                log!(embedded@warn "missing window, cannot map");
+                log!(embedded "no window, cannot map");
                 return Ok(());
             };
 
@@ -606,7 +635,7 @@ mod x11 {
         ) -> Z {
             let Some(window) = *self.embedded_win.read()
             else {
-                log!(embedded@warn "no window, cannot resize");
+                log!(embedded "no window, cannot resize");
                 return Ok(());
             };
 
@@ -628,26 +657,22 @@ mod x11 {
             return Ok(());
         }
 
-        pub(crate) fn focus(&self) -> Z {
-            if !self.pending_focus.read() {
-                log!(embedded@warn "focus is not pending, ignoring focus request");
-            }
-
+        pub(crate) fn focus(&self) -> Z<bool> {
             let Some(window) = *self.embedded_win.read()
             else {
                 log!(embedded@warn "no embedded window, cannot focus");
-                return Ok(());
+                return Ok(false);
             };
 
             if !self.is_viewable()? {
-                log!(embedded@warn "embedded window not viewable, marking as not ready and ignoring focus");
+                log!(embedded "embedded window not viewable, marking as not ready and ignoring focus");
                 self.ready.write(false);
-                return Ok(());
+                return Ok(false);
             }
 
             if self.is(self.x11.get().conn.get_input_focus()?.reply()?.focus) {
                 log!(embedded "already focused, not doing anything further");
-                return Ok(());
+                return Ok(true);
             }
 
             self.x11
@@ -662,9 +687,7 @@ mod x11 {
 
             self.x11.get().conn.flush()?;
 
-            self.pending_focus.write(false);
-
-            Ok(())
+            Ok(true)
         }
 
         pub(crate) fn clear(&self) {
@@ -720,6 +743,11 @@ mod x11 {
             return Ok(());
         }
 
+        pub(crate) fn is_focused(&self) -> Z<bool> {
+            let focus = self.x11.get().conn.get_input_focus()?.reply()?.focus;
+            return Ok(self.is(focus));
+        }
+
         pub(crate) fn destroy(&self) -> Z {
             let conn = &self.x11.get().conn;
             conn.destroy_window(self.window)?.check()?;
@@ -761,6 +789,15 @@ mod x11 {
             self.ready.write(false);
 
             Ok(())
+        }
+
+        pub(crate) fn is_parent_of(
+            &self,
+            window: Window,
+        ) -> Z<bool> {
+            let parent =
+                self.x11.get().conn.query_tree(window)?.reply()?.parent;
+            return Ok(self.is(parent));
         }
 
         pub(crate) fn is(
@@ -900,7 +937,6 @@ mod x11 {
         let this = EmbeddedWindowMan {
             x11,
             ready,
-            pending_focus: R::of(true),
             embedded_win: O::none(),
         };
         return this;
@@ -963,7 +999,7 @@ mod app {
     }
 
     struct EmbeddedProcess {
-        pid: libc::pid_t,
+        child: std::process::Child,
         gid: libc::pid_t,
     }
 
@@ -998,12 +1034,18 @@ mod app {
             Ok(())
         }
 
+        /// Process buffered XCB events before blocking on file descriptors.
+        ///
+        /// Synchronous request checks and replies can consume socket data while
+        /// leaving events queued in XCB, so POLLIN alone cannot drive dispatch.
         pub(crate) fn ekran(&mut self) -> Z {
             log!(ekran "reap hosted");
             self.reap_hosted()?;
             if self.closed {
                 return Ok(());
             }
+
+            self.process_x11_events()?;
 
             log!(ekran "watch fds");
             let watches = self.dbus.watch_fds();
@@ -1017,14 +1059,20 @@ mod app {
 
             log!(ekran "poll...");
             let timeout = self.discovery_timeout();
-            let timed_out = dragons::poll(&mut fds, timeout, || !self.closed)?;
+            let timed_out = match dragons::poll(&mut fds, timeout) {
+                Ok(timed_out) => timed_out,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    return Ok(());
+                }
+                Err(err) => return Err(err.into()),
+            };
             if timed_out {
                 log!(ekran "retry discovery on poll timeout");
                 self.retry_discovery()?;
                 return Ok(());
             }
 
-            let mask = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+            let mask = libc::POLLERR | libc::POLLHUP;
             if fds[0].revents & mask != 0 {
                 log!(ekran@info "X11 connection closed");
                 self.quit()?;
@@ -1032,13 +1080,7 @@ mod app {
             }
 
             if (fds[0].revents & libc::POLLIN) != 0 {
-                let x11 = self.x11.clone();
-                while let Some(event) = x11.get().poll()? {
-                    if let Err(err) = self.process_x11_event(event) {
-                        log!(ekran@fail "error processing X11 events: {}", err);
-                        break;
-                    }
-                }
+                self.process_x11_events()?;
             }
 
             for (watch, pollfd) in watches.iter().zip(&fds[1..]) {
@@ -1051,6 +1093,20 @@ mod app {
             }
 
             return Ok(());
+        }
+
+        fn process_x11_events(&mut self) -> Z {
+            loop {
+                let event = self.x11.get().poll()?;
+                let Some(event) = event
+                else {
+                    return Ok(());
+                };
+
+                if let Err(err) = self.process_x11_event(event) {
+                    log!(ekran@warn "error processing X11 events: {}", err);
+                }
+            }
         }
 
         fn process_x11_event(
@@ -1080,13 +1136,17 @@ mod app {
 
                 Event::ReparentNotify(event)
                     if self.embedded.is(event.window)
-                        && !self.host.is(event.parent) =>
+                        && !self.host.is(event.parent)
+                        && !self.host.is_parent_of(event.window)? =>
                 {
                     log!(
-                        ctx@warn "embedded window was reparented away: window={:#x}, parent={:#x}",
+                        ctx "embedded window was reparented away: window={:#x}, parent={:#x}",
                         event.window,
                         event.parent
                     );
+                    self.ready.write(false);
+                    self.embedded.clear();
+                    self.schedule_discovery();
                 }
 
                 Event::MapNotify(event) if self.host.is(event.window) => {
@@ -1096,11 +1156,15 @@ mod app {
                 }
 
                 Event::UnmapNotify(event) if self.host.is(event.window) => {
-                    self.focus_pending = false;
+                    self.ready.write(false);
                 }
 
                 Event::FocusIn(event) if self.host.is(event.event) => {
-                    if self.showing {
+                    if self.showing
+                        && event.mode
+                            == x11rb::protocol::xproto::NotifyMode::NORMAL
+                        && self.host.is_focused()?
+                    {
                         self.focus_pending = true;
                         self.update_readiness()?;
                     }
@@ -1146,6 +1210,7 @@ mod app {
                         "embedded X11 window was destroyed: {:#x}",
                         event.window
                     );
+                    self.ready.write(false);
                     self.embedded.clear();
                     self.schedule_discovery();
                 }
@@ -1174,10 +1239,13 @@ mod app {
                 it.current_dir(dir);
             }
 
-            let pid = it.spawn()?.id() as libc::pid_t;
+            let child = it.spawn()?;
+            // Linux Child::id originates as a positive pid_t. process_group(0)
+            // makes that PID the group ID as well.
+            let pid = child.id() as libc::pid_t;
 
             self.process_group = Some(pid);
-            self.process = Some(EmbeddedProcess { pid, gid: pid });
+            self.process = Some(EmbeddedProcess { child, gid: pid });
 
             self.schedule_discovery();
 
@@ -1185,21 +1253,13 @@ mod app {
         }
 
         fn reap_hosted(&mut self) -> Z {
-            let Some(hosted) = self.process.as_ref()
+            let Some(hosted) = self.process.as_mut()
             else {
                 return Ok(());
             };
 
-            let (pid, status) = dragons::waitpid(hosted.pid)?;
-
-            if pid == hosted.pid {
+            if let Some(status) = hosted.child.try_wait()? {
                 self.on_child_exit(status)?;
-            }
-            else if pid < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ECHILD) {
-                    Err(err)?;
-                }
             }
 
             return Ok(());
@@ -1231,15 +1291,15 @@ mod app {
 
         fn on_child_exit(
             &mut self,
-            status: i32,
+            status: std::process::ExitStatus,
         ) -> Z {
             if let Some(hosted) = self.process.take() {
                 log!(ctx@info
                     "hosted process exited status, pid={}, status={}",
-                    hosted.pid,
+                    hosted.child.id(),
                     status
                 );
-                dragons::try_kill(-hosted.gid);
+                dragons::try_kill_group(hosted.gid);
             }
             return self.quit();
         }
@@ -1327,26 +1387,33 @@ mod app {
             &mut self,
             window: x11rb::protocol::xproto::Window,
         ) -> Z {
+            let x11 = self.x11.get();
+            let server_grab = x11.grab_server()?;
             self.host.embed(window)?;
             self.embedded.write(window);
             self.embedded.resize(*self.host.area())?;
             self.embedded.map_window()?;
 
+            drop(server_grab);
+            x11.flush()?;
+            drop(x11);
+
             self.window_discovery = None;
+            self.focus_pending = self.showing;
             return self.update_readiness();
         }
 
-        fn update_readiness(&self) -> Z {
+        /// Clear focus intent only after a successful or already-satisfied request.
+        /// Never focus the host here: its FocusIn would trigger another handoff.
+        fn update_readiness(&mut self) -> Z {
             self.ready.write(self.embedded.is_viewable()?);
 
-            if self.ready.read() {
-                if !self.showing {
-                    log!(ctx "now showing the root window, not focusing");
-                }
-                else {
-                    self.host.focus()?;
-                    self.embedded.focus()?;
-                }
+            if self.ready.read()
+                && self.showing
+                && self.focus_pending
+                && self.embedded.focus()?
+            {
+                self.focus_pending = false;
             }
 
             return Ok(());
@@ -1376,8 +1443,13 @@ mod app {
                 if !self.embedded.is_present() {
                     self.attach()?;
                 }
-                self.embedded.map_window()?;
-                self.host.focus()
+                if self.embedded.is_present() {
+                    self.embedded.map_window()?;
+                    self.update_readiness()
+                }
+                else {
+                    self.host.focus()
+                }
             }
         }
 
@@ -1388,7 +1460,7 @@ mod app {
             self.closed = true;
 
             if let Some(hosted) = self.process.take() {
-                dragons::try_kill(-hosted.gid);
+                dragons::try_kill_group(hosted.gid);
             }
 
             self.host.destroy()?;
