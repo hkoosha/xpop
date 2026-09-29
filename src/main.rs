@@ -676,7 +676,10 @@ mod x11 {
                 return Ok(false);
             }
 
-            if self.is(self.x11.get().conn.get_input_focus()?.reply()?.focus) {
+            let focus = self.x11.get().conn.get_input_focus()?.reply()?;
+            if self.is(focus.focus)
+                && focus.revert_to == InputFocus::POINTER_ROOT
+            {
                 log!(embedded "already focused, not doing anything further");
                 return Ok(true);
             }
@@ -685,7 +688,7 @@ mod x11 {
                 .get()
                 .conn
                 .set_input_focus(
-                    InputFocus::PARENT,
+                    InputFocus::POINTER_ROOT,
                     window,
                     x11rb::CURRENT_TIME,
                 )?
@@ -740,7 +743,7 @@ mod x11 {
                 .get()
                 .conn
                 .set_input_focus(
-                    InputFocus::PARENT,
+                    InputFocus::POINTER_ROOT,
                     self.window,
                     x11rb::CURRENT_TIME,
                 )?

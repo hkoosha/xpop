@@ -20,7 +20,7 @@ macro_rules! log {
         eprintln!($fmt $($args)*);
     };
 }
-const ROOT: Window = 1;
+const ROOT: Window = 0x10;
 const HOST: Window = 0x100;
 const CLIENT: Window = 0x200;
 const OUTSIDE: Window = 0x300;
@@ -107,6 +107,7 @@ fn reparented(parent: Window) -> Event {
 // In-memory event/ownership model; no X connection, X server, or D-Bus daemon.
 struct State {
     focus: Window,
+    revert_to: InputFocus,
     parent: Window,
     client_mapped: bool,
     host_mapped: bool,
@@ -115,6 +116,33 @@ struct State {
     delivered: usize,
     fail_focus: bool,
     detached_resizes: usize,
+}
+impl State {
+    // XSetInputFocus: losing a viewable focus window applies revert_to.
+    // RevertToParent also resets the next reversion to RevertToNone.
+    // https://www.x.org/archive/current/doc/man/man3/XSetInputFocus.3.xhtml
+    fn revert_focus(&mut self) {
+        self.focus = match self.revert_to {
+            InputFocus::PARENT => {
+                self.revert_to = InputFocus::NONE;
+                if self.focus == CLIENT
+                    && self.parent == HOST
+                    && self.host_mapped
+                {
+                    HOST
+                }
+                else {
+                    ROOT
+                }
+            }
+            InputFocus::POINTER_ROOT => u32::from(InputFocus::POINTER_ROOT),
+            InputFocus::NONE => x11rb::NONE,
+            _ => panic!("unsupported core focus reversion"),
+        };
+        if self.focus == HOST {
+            self.events.push_back(focus_in(NotifyMode::NORMAL));
+        }
+    }
 }
 struct Reply<T>(T);
 impl<T> Reply<T> {
@@ -135,6 +163,7 @@ impl Checked {
 }
 struct FocusReply {
     focus: Window,
+    revert_to: InputFocus,
 }
 struct TreeReply {
     parent: Window,
@@ -146,6 +175,7 @@ impl Conn {
     fn get_input_focus(&self) -> Z<Reply<FocusReply>> {
         Ok(Reply(FocusReply {
             focus: self.state.borrow().focus,
+            revert_to: self.state.borrow().revert_to,
         }))
     }
     fn query_tree(
@@ -163,7 +193,7 @@ impl Conn {
     }
     fn set_input_focus(
         &self,
-        _: InputFocus,
+        revert_to: InputFocus,
         window: Window,
         _: u32,
     ) -> Z<Checked> {
@@ -172,6 +202,7 @@ impl Conn {
             return Ok(Checked(true));
         }
         s.focus_requests.push(window);
+        s.revert_to = revert_to;
         let old = s.focus;
         if old == window {
             return Ok(Checked(false));
@@ -230,16 +261,11 @@ impl Conn {
             })
         };
         s.events.push_back(event);
-        if !value && s.focus == window {
-            s.focus = if window == CLIENT && s.parent == HOST && s.host_mapped {
-                HOST
-            }
-            else {
-                OUTSIDE
-            };
-            if s.focus == HOST {
-                s.events.push_back(focus_in(NotifyMode::NORMAL));
-            }
+        if !value
+            && (s.focus == window
+                || (window == HOST && s.focus == CLIENT && s.parent == HOST))
+        {
+            s.revert_focus();
         }
     }
 }
@@ -414,6 +440,7 @@ impl Ctx {
 fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
     let state = Rc::new(RefCell::new(State {
         focus: OUTSIDE,
+        revert_to: InputFocus::NONE,
         parent: HOST,
         client_mapped: true,
         host_mapped: true,
@@ -647,6 +674,70 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
             "{failures} focus replay scenario(s) failed"
         ))
         .into());
+    }
+    Ok(())
+}
+
+#[test]
+fn client_and_host_loss_cannot_discard_keyboard_focus() -> Z {
+    for order in [[CLIENT, HOST], [HOST, CLIENT]] {
+        let (ctx, state) = make_ctx();
+        assert!(ctx.embedded.focus()?);
+        let mut focus_after_loss = [0; 2];
+        for (index, window) in order.into_iter().enumerate() {
+            // Destruction/disconnection makes the window and its descendants
+            // unviewable. Do not dispatch events or run any xpop cleanup.
+            ctx.x11.get().conn.set_mapped(window, false);
+            focus_after_loss[index] = state.borrow().focus;
+        }
+        assert_eq!(
+            focus_after_loss,
+            [u32::from(InputFocus::POINTER_ROOT); 2],
+            "window loss order {order:?} must leave keyboard input enabled"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn already_focused_client_still_arms_safe_reversion() -> Z {
+    let (ctx, state) = make_ctx();
+    {
+        let mut s = state.borrow_mut();
+        s.focus = CLIENT;
+        s.revert_to = InputFocus::PARENT;
+    }
+    assert!(ctx.embedded.focus()?);
+    ctx.x11.get().conn.set_mapped(CLIENT, false);
+    ctx.x11.get().conn.set_mapped(HOST, false);
+    assert_eq!(state.borrow().focus, u32::from(InputFocus::POINTER_ROOT));
+    Ok(())
+}
+
+#[test]
+fn host_loss_before_embedding_cannot_discard_keyboard_focus() -> Z {
+    let (ctx, state) = make_ctx();
+    ctx.embedded.clear();
+    ctx.x11.get().conn.set_mapped(CLIENT, false);
+    ctx.host.focus()?;
+    ctx.x11.get().conn.set_mapped(HOST, false);
+    assert_eq!(state.borrow().focus, u32::from(InputFocus::POINTER_ROOT));
+    Ok(())
+}
+
+#[test]
+fn window_loss_does_not_steal_another_clients_focus() -> Z {
+    for order in [[CLIENT, HOST], [HOST, CLIENT]] {
+        let (ctx, state) = make_ctx();
+        assert!(ctx.embedded.focus()?);
+        let x11 = ctx.x11.get();
+        x11.conn
+            .set_input_focus(InputFocus::PARENT, OUTSIDE, x11rb::CURRENT_TIME)?
+            .check()?;
+        for window in order {
+            x11.conn.set_mapped(window, false);
+            assert_eq!(state.borrow().focus, OUTSIDE);
+        }
     }
     Ok(())
 }
