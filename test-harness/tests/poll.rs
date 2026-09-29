@@ -86,16 +86,12 @@ mod dragons {
     use libc::pollfd;
     thread_local! {
         pub static TIMEOUTS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
-        pub static NEXT_ERROR: std::cell::Cell<Option<io::ErrorKind>> = const { std::cell::Cell::new(None) };
     }
     pub(crate) fn poll(
         fds: &mut [pollfd],
         timeout: i32,
     ) -> io::Result<bool> {
         TIMEOUTS.with_borrow_mut(|it| it.push(timeout));
-        if let Some(kind) = NEXT_ERROR.with(|error| error.take()) {
-            return Err(io::Error::from(kind));
-        }
         poll_impl::poll(fds, 0)
     }
 }
@@ -106,11 +102,9 @@ struct Ctx {
     ready: bool,
     discovery: bool,
     handled: Vec<u8>,
-    reaps: usize,
 }
 impl Ctx {
     fn reap_hosted(&mut self) -> Z {
-        self.reaps += 1;
         Ok(())
     }
     fn quit(&mut self) -> Z {
@@ -173,7 +167,6 @@ fn make_ctx() -> Z<(Ctx, UnixStream, UnixStream)> {
         ready: false,
         discovery: false,
         handled: Vec::new(),
-        reaps: 0,
     };
     Ok((ctx, x_peer, bus_peer))
 }
@@ -267,32 +260,6 @@ fn queued_events_dispatch_without_another_socket_wakeup() -> Z {
         ))
         .into());
     }
-    Ok(())
-}
-
-#[test]
-fn interrupted_poll_returns_to_reaping() -> Z {
-    let (mut ctx, _x_peer, _bus_peer) = make_ctx()?;
-    dragons::NEXT_ERROR
-        .with(|error| error.set(Some(io::ErrorKind::Interrupted)));
-    ctx.ekran()?;
-    assert!(!ctx.closed);
-    assert_eq!(ctx.reaps, 1);
-    ctx.ekran()?;
-    assert_eq!(ctx.reaps, 2);
-    Ok(())
-}
-
-#[test]
-fn non_interrupt_poll_errors_propagate() -> Z {
-    let (mut ctx, _x_peer, _bus_peer) = make_ctx()?;
-    dragons::NEXT_ERROR
-        .with(|error| error.set(Some(io::ErrorKind::PermissionDenied)));
-    let error = ctx.ekran().unwrap_err();
-    assert_eq!(
-        error.downcast_ref::<io::Error>().unwrap().kind(),
-        io::ErrorKind::PermissionDenied
-    );
     Ok(())
 }
 

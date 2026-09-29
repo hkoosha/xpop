@@ -83,12 +83,12 @@ macro_rules! log {
     ($whom:ident@warn $fmt:literal $($arg:tt)*) => {{ log!([WARN, $whom, $fmt], [$($arg)*]); }};
     ($whom:ident@fail $fmt:literal $($arg:tt)*) => {{ log!([FAIL, $whom, $fmt], [$($arg)*]); }};
     ($whom:ident@trac $fmt:literal $($arg:tt)*) => {{
-        if $crate::cfg::TRACE.load(::std::sync::atomic::Ordering::SeqCst) {
+        if $crate::cfg::TRACE.load(::std::sync::atomic::Ordering::Relaxed) {
             log!([TRAC, $whom, $fmt], [$($arg)*]);
         }
     }};
     ($whom:ident $fmt:literal $($arg:tt)*) => {{
-        if $crate::cfg::DEBUG.load(::std::sync::atomic::Ordering::SeqCst) {
+        if $crate::cfg::DEBUG.load(::std::sync::atomic::Ordering::Relaxed) {
             log!([DBUG, $whom, $fmt], [$($arg)*]);
         }
     }};
@@ -165,6 +165,8 @@ mod dragons {
         return Ok(group);
     }
 
+    /// Return true on timeout; preserve EINTR so the event loop can reap children.
+    /// POLLNVAL on any descriptor is reported as EBADF, not as readable activity.
     pub(crate) fn poll(
         fds: &mut [pollfd],
         timeout: i32,
@@ -216,6 +218,10 @@ mod dragons {
         }
     }
 
+    /// Arm SIGTERM on parent-thread death when Command::spawn runs the hook.
+    /// Capture the expected parent before fork; hook failures return through spawn.
+    /// Linux clears this setting for credential-changing execs; see
+    /// <https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html>.
     pub(crate) fn pre_exec(it: &mut Command) {
         let parent = std::process::id();
 
