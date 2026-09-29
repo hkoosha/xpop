@@ -663,6 +663,11 @@ mod x11 {
             return Ok(());
         }
 
+        /// Arm server-side recovery even when the client already has focus.
+        ///
+        /// RevertToParent becomes RevertToNone after reverting to the host. If
+        /// the host then disappears, X discards keyboard input. PointerRoot
+        /// avoids this cascade without either process having to run cleanup.
         pub(crate) fn focus(&self) -> Z<bool> {
             let Some(window) = *self.embedded_win.read()
             else {
@@ -738,6 +743,7 @@ mod x11 {
             return Ok(());
         }
 
+        /// Keep PointerRoot reversion if xpop exits before a client is attached.
         pub(crate) fn focus(&self) -> Z {
             self.x11
                 .get()
