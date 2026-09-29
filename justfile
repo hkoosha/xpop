@@ -17,6 +17,9 @@ fmt: c
 clippy: fmt c
   cargo clippy -- -A clippy::needless_return
 
+fix: fmt c
+  cargo clippy --fix -- -A clippy::needless_return
+
 run *args: build c
   @cargo run -- {{ args }}
 
