@@ -555,6 +555,18 @@ mod x11 {
             Ok(())
         }
 
+        pub(crate) fn hide(&self) -> Z {
+            let Some(window) = *self.embedded_win.read()
+            else {
+                return Ok(());
+            };
+
+            let conn = &self.x11.get().conn;
+            conn.unmap_window(window)?.check()?;
+            conn.flush()?;
+            return Ok(());
+        }
+
         pub(crate) fn write(
             &self,
             window: Window,
@@ -580,23 +592,6 @@ mod x11 {
             };
 
             return self.x11.get().is_viewable(window);
-        }
-
-        pub(crate) fn redraw(&self) -> Z {
-            let Some(window) = *self.embedded_win.read()
-            else {
-                log!(embedded@warn "no window, cannot redraw");
-                return Ok(());
-            };
-
-            log!(embedded "redraw");
-            self.x11
-                .get()
-                .conn
-                .clear_area(true, window, 0, 0, 0, 0)?
-                .check()?;
-            self.x11.get().conn.flush()?;
-            return Ok(());
         }
 
         pub(crate) fn resize(
@@ -1095,7 +1090,7 @@ mod app {
             fd: libc::c_int,
             revents: libc::c_short,
         ) -> Z {
-            let mut toggled = false;
+            let mut should_toggle = false;
             for item in self
                 .dbus
                 .watch_handle(fd, WatchEvent::from_revents(revents))
@@ -1103,11 +1098,11 @@ mod app {
                 if let ConnectionItem::Signal(message) = item
                     && self.signal_rule.matches(&message)
                 {
-                    toggled = true;
+                    should_toggle = true;
                 }
             }
 
-            if toggled {
+            if should_toggle {
                 self.toggle()?;
             }
 
@@ -1268,10 +1263,7 @@ mod app {
 
             self.attach()?;
 
-            if self.embedded.is_present() {
-                self.embedded.redraw()?;
-            }
-            else {
+            if !self.embedded.is_present() {
                 let delay = min(
                     discovery.delay.saturating_mul(2),
                     Self::DISCOVERY_MAX_DELAY,
@@ -1364,6 +1356,8 @@ mod app {
             self.focus_pending = self.showing;
 
             if !self.showing {
+                self.ready.write(false);
+                self.embedded.hide()?;
                 self.host.hide()
             }
             else {
