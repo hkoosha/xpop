@@ -1,3 +1,9 @@
+# App dies on startup:
+
+[001790720808.168] [io.koosha.xpop::FAIL::unexpected] unexpected error: x11 reply error
+Error: X11Reply(X11Error(X11Error { error_kind: Match, error_code: 8, sequence: 124, bad_value: 31457298, minor_opcode: 0, major_opcode: 42, extension_name: None, request_name: Some("SetInputFocus") }))
+
+# Bring bakc focus_out:
 
     #[allow(dead_code, unused)]
     fn connect_focus_out_event(ctx: Rc<RefCell<Ctx>>) {

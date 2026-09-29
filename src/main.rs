@@ -285,6 +285,9 @@ mod errors {
         #[error("no X11 screen")]
         NoScreen,
 
+        #[error("no 32-bit TrueColor visual with alpha on the X11 screen")]
+        NoArgbVisual,
+
         #[error("io error: {0}")]
         Io(#[from] io::Error),
 
@@ -408,7 +411,9 @@ mod x11 {
         connection::Connection as _,
         protocol::{
             Event,
+            render,
             xproto::{
+                self,
                 Atom,
                 AtomEnum,
                 ChangeWindowAttributesAux,
@@ -713,6 +718,7 @@ mod x11 {
         x11: R<X11Host>,
         area: Area,
         window: Window,
+        colormap: xproto::Colormap,
         ready: R<bool>,
     }
 
@@ -766,6 +772,7 @@ mod x11 {
         pub(crate) fn destroy(&self) -> Z {
             let conn = &self.x11.get().conn;
             conn.destroy_window(self.window)?.check()?;
+            conn.free_colormap(self.colormap)?.check()?;
             conn.flush()?;
             return Ok(());
         }
@@ -823,12 +830,76 @@ mod x11 {
         }
     }
 
+    fn find_argb_visual(
+        setup: &xproto::Setup,
+        root: Window,
+        formats: &render::QueryPictFormatsReply,
+    ) -> Z<xproto::Visualid> {
+        let (screen_index, screen) = setup
+            .roots
+            .iter()
+            .enumerate()
+            .find(|(_, screen)| screen.root == root)
+            .ok_or(MyError::NoScreen)?;
+        let depth = screen
+            .allowed_depths
+            .iter()
+            .find(|depth| depth.depth == 32)
+            .ok_or(MyError::NoArgbVisual)?;
+        let pict_depth = formats
+            .screens
+            .get(screen_index)
+            .and_then(|screen| {
+                screen.depths.iter().find(|depth| depth.depth == 32)
+            })
+            .ok_or(MyError::NoArgbVisual)?;
+
+        for visual in &depth.visuals {
+            if visual.class != xproto::VisualClass::TRUE_COLOR {
+                continue;
+            }
+            let Some(pict_visual) = pict_depth
+                .visuals
+                .iter()
+                .find(|it| it.visual == visual.visual_id)
+            else {
+                continue;
+            };
+            if formats.formats.iter().any(|format| {
+                format.id == pict_visual.format
+                    && format.type_ == render::PictType::DIRECT
+                    && format.depth == 32
+                    && format.direct.alpha_mask != 0
+            }) {
+                return Ok(visual.visual_id);
+            }
+        }
+
+        return Err(MyError::NoArgbVisual);
+    }
+
     fn create_host_window(
         x11: R<X11Host>,
         area: Area,
         title: &str,
-    ) -> Z<Window> {
+    ) -> Z<(Window, xproto::Colormap)> {
         let x11 = x11.get();
+        let version = render::query_version(&x11.conn, 0, 11)?;
+        let formats = render::query_pict_formats(&x11.conn)?;
+        version.reply()?;
+        let visual = find_argb_visual(
+            x11.conn.setup(),
+            x11.root_win,
+            &formats.reply()?,
+        )?;
+        let (colormap, cookie) =
+            xproto::ColormapWrapper::create_colormap_and_get_cookie(
+                &x11.conn,
+                xproto::ColormapAlloc::NONE,
+                x11.root_win,
+                visual,
+            )?;
+        cookie.check()?;
 
         log!(x11_window@trac "generating window id...");
         let window = x11.conn.generate_id()?;
@@ -836,7 +907,7 @@ mod x11 {
         log!(x11_window@trac "creating window");
         x11.conn
             .create_window(
-                x11rb::COPY_FROM_PARENT as u8,
+                32,
                 window,
                 x11.root_win,
                 0,
@@ -845,9 +916,11 @@ mod x11 {
                 area.height,
                 0,
                 WindowClass::INPUT_OUTPUT,
-                0,
+                visual,
                 &CreateWindowAux::new()
                     .background_pixel(0)
+                    .border_pixel(0)
+                    .colormap(colormap.colormap())
                     .override_redirect(1u32)
                     .event_mask(
                         EventMask::STRUCTURE_NOTIFY
@@ -883,7 +956,7 @@ mod x11 {
         x11.conn.flush()?;
 
         log!(x11_window@trac "X11 host window created");
-        return Ok(window);
+        return Ok((window, colormap.into_colormap()));
     }
 
     pub(crate) fn open_x11() -> Z<(R<X11Host>, Area)> {
@@ -934,9 +1007,11 @@ mod x11 {
         ready: R<bool>,
     ) -> Z<HostWindowMan> {
         log!(x11@trac "creating raw window...");
+        let (window, colormap) = create_host_window(x11.clone(), area, title)?;
 
         let this = HostWindowMan {
-            window: create_host_window(x11.clone(), area, title)?,
+            window,
+            colormap,
             x11,
             area,
             ready,

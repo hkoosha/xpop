@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 libc = "0.2"
-x11rb = "0.14"
+x11rb = { version = "0.14", features = ["render"] }
 
 [build-dependencies]
 quote = "1"
@@ -30,3 +30,7 @@ path = "tests/poll.rs"
 [[test]]
 name = "syscalls"
 path = "tests/syscalls.rs"
+
+[[test]]
+name = "visual"
+path = "tests/visual.rs"

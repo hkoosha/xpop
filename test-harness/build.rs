@@ -78,6 +78,19 @@ fn methods<'a>(
         .collect()
 }
 
+fn function<'a>(
+    items: &'a [Item],
+    name: &str,
+) -> &'a syn::ItemFn {
+    items
+        .iter()
+        .find_map(|item| match item {
+            Item::Fn(function) if function.sig.ident == name => Some(function),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("production function {name} is missing"))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let source = root.join("../src/main.rs").canonicalize()?;
@@ -113,16 +126,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     fs::write(output.join("focus_methods.rs"), focus.to_string())?;
 
+    let find_argb_visual = function(x11, "find_argb_visual");
+    fs::write(
+        output.join("visual_methods.rs"),
+        quote! { #find_argb_visual }.to_string(),
+    )?;
+
     let dragons = module(&parsed.items, "dragons");
-    let poll_function = contents(dragons)
-        .iter()
-        .find_map(|item| match item {
-            Item::Fn(function) if function.sig.ident == "poll" => {
-                Some(function)
-            }
-            _ => None,
-        })
-        .expect("production dragons::poll is missing");
+    let poll_function = function(contents(dragons), "poll");
     let polling = methods(context, &["ekran", "process_x11_events"]);
     let poll = quote! {
         impl Ctx { #(#polling)* }
