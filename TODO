@@ -24,3 +24,9 @@ Error: X11Reply(X11Error(X11Error { error_kind: Match, error_code: 8, sequence: 
         });
     }
     
+
+
+---
+
+
+panics on invalid dbus interface

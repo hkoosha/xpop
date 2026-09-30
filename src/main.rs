@@ -1,11 +1,17 @@
 #![allow(clippy::needless_return)]
 
-use dbus::{
-    Message,
-    ffidisp::Connection as DBusConn,
-};
-
 pub const NAMESPACE: &str = "io.koosha.xpop";
+const DBUS_PATH: &str = "/io/koosha/xpop";
+
+/**
+ * This crates uses 3 one letter types:
+ *
+ * Z<T> : An alias for Result<T, crate::errors::MyError>
+ * R<T> : A wrapper around the mouthful Rc<RefCell<T>>
+ * O<T> : A wrapper around the mouthful Rc<RefCell<Option<T>>>
+ *
+ * Additionally a plain `Z` defaults to `Z<()>`.
+ */
 
 #[derive(Default)]
 struct R<T> {
@@ -41,7 +47,7 @@ impl<T> R<T> {
 
 impl<T: Copy> R<T> {
     fn read(&self) -> T {
-        return self.store.borrow().clone();
+        return *self.store.borrow();
     }
 }
 
@@ -51,12 +57,6 @@ struct O<T> {
 }
 
 impl<T> O<T> {
-    fn none() -> Self {
-        return Self {
-            store: std::rc::Rc::new(std::cell::RefCell::new(None)),
-        };
-    }
-
     fn read(&self) -> std::cell::Ref<'_, Option<T>> {
         return self.store.borrow();
     }
@@ -77,6 +77,7 @@ impl<T> O<T> {
     }
 }
 
+// Good enough for xpop, no need for extra dependencies..
 #[clippy::format_args]
 macro_rules! log {
     ($whom:ident@info $fmt:literal $($arg:tt)*) => {{ log!([INFO, $whom, $fmt], [$($arg)*]); }};
@@ -354,18 +355,15 @@ mod cfg {
         #[arg(short, long)]
         pub(crate) working_dir: Option<PathBuf>,
 
-        #[arg(long, default_value_t = crate::NAMESPACE.to_string())]
-        pub(crate) dbus_interface: String,
-
-        #[arg(long, default_value_t = crate::NAMESPACE.split('.').last().unwrap().to_string())]
-        pub(crate) dbus_member: String,
-
-        #[arg(long, default_value_t = { let mut value = crate::NAMESPACE.replace('.', "/"); value.insert(0, '/'); value }
-        )]
-        pub(crate) dbus_path: String,
+        /// D-Bus member used to identify the app to toggle.
+        #[arg(short, long, default_value = "xpop", value_parser = parse_dbus_member)]
+        pub(crate) member: String,
 
         #[arg(long, default_value = "appear")]
         pub(crate) on_start: Behavior,
+
+        #[arg(long, default_value = "appear")]
+        pub(crate) on_exit: Behavior,
 
         #[arg(long, default_value = "main")]
         pub(crate) title: String,
@@ -389,6 +387,21 @@ mod cfg {
         pub(crate) y: i16,
         pub(crate) width: u16,
         pub(crate) height: u16,
+    }
+
+    fn parse_dbus_member(value: &str) -> Result<String, &'static str> {
+        if value.is_empty()
+            || value.len() > 255
+            || value.as_bytes()[0].is_ascii_digit()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(
+                "must match ^[A-Za-z_][A-Za-z0-9_]{0,254}$ (1-255 ASCII characters, no leading digit)",
+            );
+        }
+        return Ok(value.to_owned());
     }
 
     pub(crate) fn args_or_exit() -> Args {
@@ -718,7 +731,7 @@ mod x11 {
         x11: R<X11Host>,
         area: Area,
         window: Window,
-        colormap: xproto::Colormap,
+        colormap: Option<xproto::Colormap>,
         ready: R<bool>,
     }
 
@@ -772,7 +785,9 @@ mod x11 {
         pub(crate) fn destroy(&self) -> Z {
             let conn = &self.x11.get().conn;
             conn.destroy_window(self.window)?.check()?;
-            conn.free_colormap(self.colormap)?.check()?;
+            if let Some(colormap) = self.colormap {
+                conn.free_colormap(colormap)?.check()?;
+            }
             conn.flush()?;
             return Ok(());
         }
@@ -882,24 +897,42 @@ mod x11 {
         x11: R<X11Host>,
         area: Area,
         title: &str,
-    ) -> Z<(Window, xproto::Colormap)> {
+    ) -> Z<(Window, Option<xproto::Colormap>)> {
         let x11 = x11.get();
-        let version = render::query_version(&x11.conn, 0, 11)?;
-        let formats = render::query_pict_formats(&x11.conn)?;
-        version.reply()?;
-        let visual = find_argb_visual(
-            x11.conn.setup(),
-            x11.root_win,
-            &formats.reply()?,
-        )?;
-        let (colormap, cookie) =
-            xproto::ColormapWrapper::create_colormap_and_get_cookie(
-                &x11.conn,
-                xproto::ColormapAlloc::NONE,
-                x11.root_win,
-                visual,
-            )?;
-        cookie.check()?;
+        let transparent = (|| -> Z<_> {
+            render::query_version(&x11.conn, 0, 11)?.reply()?;
+            let formats = render::query_pict_formats(&x11.conn)?.reply()?;
+            let visual =
+                find_argb_visual(x11.conn.setup(), x11.root_win, &formats)?;
+            let (colormap, cookie) =
+                xproto::ColormapWrapper::create_colormap_and_get_cookie(
+                    &x11.conn,
+                    xproto::ColormapAlloc::NONE,
+                    x11.root_win,
+                    visual,
+                )?;
+            cookie.check()?;
+            return Ok((visual, colormap));
+        })();
+        let (depth, visual, colormap) = match transparent {
+            Ok((visual, colormap)) => (32, visual, Some(colormap)),
+            Err(err) => {
+                log!(x11_window@warn "cannot enable transparency, using the default visual: {}", err);
+                (x11rb::COPY_DEPTH_FROM_PARENT, x11rb::COPY_FROM_PARENT, None)
+            }
+        };
+        let mut attributes = CreateWindowAux::new()
+            .background_pixel(0)
+            .border_pixel(0)
+            .override_redirect(1u32)
+            .event_mask(
+                EventMask::STRUCTURE_NOTIFY
+                    | EventMask::FOCUS_CHANGE
+                    | EventMask::EXPOSURE,
+            );
+        if let Some(colormap) = &colormap {
+            attributes = attributes.colormap(colormap.colormap());
+        }
 
         log!(x11_window@trac "generating window id...");
         let window = x11.conn.generate_id()?;
@@ -907,7 +940,7 @@ mod x11 {
         log!(x11_window@trac "creating window");
         x11.conn
             .create_window(
-                32,
+                depth,
                 window,
                 x11.root_win,
                 0,
@@ -917,16 +950,7 @@ mod x11 {
                 0,
                 WindowClass::INPUT_OUTPUT,
                 visual,
-                &CreateWindowAux::new()
-                    .background_pixel(0)
-                    .border_pixel(0)
-                    .colormap(colormap.colormap())
-                    .override_redirect(1u32)
-                    .event_mask(
-                        EventMask::STRUCTURE_NOTIFY
-                            | EventMask::FOCUS_CHANGE
-                            | EventMask::EXPOSURE,
-                    ),
+                &attributes,
             )?
             .check()?;
 
@@ -956,7 +980,7 @@ mod x11 {
         x11.conn.flush()?;
 
         log!(x11_window@trac "X11 host window created");
-        return Ok((window, colormap.into_colormap()));
+        return Ok((window, colormap.map(|it| it.into_colormap())));
     }
 
     pub(crate) fn open_x11() -> Z<(R<X11Host>, Area)> {
@@ -1027,7 +1051,7 @@ mod x11 {
         let this = EmbeddedWindowMan {
             x11,
             ready,
-            embedded_win: O::none(),
+            embedded_win: O::default(),
         };
         return this;
     }
@@ -1106,6 +1130,7 @@ mod app {
         last_toggle: SystemTime,
         window_discovery: Option<Discovery>,
         process: Option<EmbeddedProcess>,
+        relaunch_at: Option<Instant>,
 
         host: HostWindowMan,
         embedded: EmbeddedWindowMan,
@@ -1115,6 +1140,7 @@ mod app {
         const TOGGLE_COOL_DOWN_MILLIS: u128 = 40;
         const DISCOVERY_INITIAL_DELAY: Duration = Duration::from_millis(100);
         const DISCOVERY_MAX_DELAY: Duration = Duration::from_secs(1);
+        const RELAUNCH_DELAY: Duration = Duration::from_millis(500);
 
         pub(crate) fn looper(&mut self) -> Z {
             while !self.closed {
@@ -1148,7 +1174,7 @@ mod app {
             fds.extend(watches.iter().map(|watch| watch.to_pollfd()));
 
             log!(ekran "poll...");
-            let timeout = self.discovery_timeout();
+            let timeout = self.poll_timeout();
             let timed_out = match dragons::poll(&mut fds, timeout) {
                 Ok(timed_out) => timed_out,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {
@@ -1157,6 +1183,9 @@ mod app {
                 Err(err) => return Err(err.into()),
             };
             if timed_out {
+                if self.relaunch_at.is_some() {
+                    return self.reap_hosted();
+                }
                 log!(ekran "retry discovery on poll timeout");
                 self.retry_discovery()?;
                 return Ok(());
@@ -1312,8 +1341,6 @@ mod app {
         }
 
         fn start(&mut self) -> Z {
-            self.dbus.add_match(&self.signal_rule.match_str())?;
-
             if self.showing {
                 self.host.show()?;
                 self.host.focus()?;
@@ -1343,6 +1370,14 @@ mod app {
         }
 
         fn reap_hosted(&mut self) -> Z {
+            if let Some(deadline) = self.relaunch_at {
+                if Instant::now() >= deadline {
+                    self.relaunch_at = None;
+                    return self.start();
+                }
+                return Ok(());
+            }
+
             let Some(hosted) = self.process.as_mut()
             else {
                 return Ok(());
@@ -1391,7 +1426,27 @@ mod app {
                 );
                 dragons::try_kill_group(hosted.gid);
             }
-            return self.quit();
+            if self.args.on_exit == Behavior::None {
+                return self.quit();
+            }
+
+            self.ready.write(false);
+            self.embedded.clear();
+            self.process_group = None;
+            self.window_discovery = None;
+            self.showing = self.args.on_exit == Behavior::Appear;
+            self.focus_pending = self.showing;
+            self.last_toggle = SystemTime::UNIX_EPOCH;
+
+            if !self.showing {
+                self.host.hide()?;
+            }
+            else {
+                self.relaunch_at = Some(Instant::now() + Self::RELAUNCH_DELAY);
+                return Ok(());
+            }
+
+            return self.start();
         }
 
         fn schedule_discovery(&mut self) {
@@ -1401,6 +1456,17 @@ mod app {
                     delay: Self::DISCOVERY_INITIAL_DELAY,
                 });
             }
+        }
+
+        fn poll_timeout(&self) -> i32 {
+            if let Some(deadline) = self.relaunch_at {
+                let millis = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .max(1);
+                return i32::try_from(millis).unwrap_or(i32::MAX);
+            }
+            return self.discovery_timeout();
         }
 
         fn discovery_timeout(&self) -> i32 {
@@ -1548,6 +1614,7 @@ mod app {
                 return Ok(());
             }
             self.closed = true;
+            self.relaunch_at = None;
 
             if let Some(hosted) = self.process.take() {
                 dragons::try_kill_group(hosted.gid);
@@ -1599,12 +1666,9 @@ mod app {
         let mut this = Ctx {
             dbus: DBusConn::new_session()?,
 
-            signal_rule: MatchRule::new_signal(
-                &args.dbus_interface,
-                &args.dbus_member,
-            )
-            .with_path(&args.dbus_path)
-            .static_clone(),
+            signal_rule: MatchRule::new_signal(crate::NAMESPACE, &args.member)
+                .with_path(crate::DBUS_PATH)
+                .static_clone(),
 
             host: open_host_man(
                 x11.clone(),
@@ -1622,6 +1686,7 @@ mod app {
             process_group: None,
             window_discovery: None,
             process: None,
+            relaunch_at: None,
             closed: false,
 
             ready,
@@ -1629,6 +1694,7 @@ mod app {
             args,
         };
 
+        this.dbus.add_match(&this.signal_rule.match_str())?;
         this.start()?;
 
         return Ok(this);
@@ -1644,6 +1710,7 @@ use crate::{
         Z,
     },
 };
+use dbus::ffidisp::Connection;
 
 fn main() -> Z {
     let it: Args = cfg::args_or_exit();
@@ -1659,14 +1726,10 @@ fn main() -> Z {
     if it.signal {
         log!(main "doing signal and quit");
 
-        return DBusConn::new_session()?
+        return Connection::new_session()?
             .send(
-                Message::new_signal(
-                    &it.dbus_path,
-                    &it.dbus_interface,
-                    &it.dbus_member,
-                )
-                .map_err(MyError::DBusSignal)?,
+                dbus::Message::new_signal(DBUS_PATH, NAMESPACE, &it.member)
+                    .map_err(MyError::DBusSignal)?,
             )
             .map(|_| ())
             .map_err(|_| MyError::DBusSend);

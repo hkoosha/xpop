@@ -98,11 +98,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = syn::parse_file(&fs::read_to_string(source)?)?;
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
+    let cfg = module(&parsed.items, "cfg");
+    fs::write(
+        output.join("argument_methods.rs"),
+        quote! {
+            #[allow(dead_code)]
+            #cfg
+        }
+        .to_string(),
+    )?;
+
     // Import current method ASTs rather than maintaining copies of their logic.
     // Missing/renamed APIs fail the build instead of silently testing old code.
     let x11 = contents(module(&parsed.items, "x11"));
     let app = contents(module(&parsed.items, "app"));
     let context = implementation(app, "Ctx");
+    let lifecycle_types = app.iter().filter(|item| {
+        matches!(item, Item::Struct(item) if item.ident == "Discovery" || item.ident == "EmbeddedProcess")
+    });
+    let context_constants = context
+        .items
+        .iter()
+        .filter(|item| matches!(item, ImplItem::Const(_)));
     let embedded =
         methods(implementation(x11, "EmbeddedWindowMan"), &["focus"]);
     let host = methods(
@@ -117,19 +134,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "embed",
             "update_readiness",
             "toggle",
+            "start",
+            "reap_hosted",
+            "on_child_exit",
+            "schedule_discovery",
+            "poll_timeout",
+            "discovery_timeout",
+            "retry_discovery",
+            "quit",
         ],
     );
     let focus = quote! {
+        #(#lifecycle_types)*
         impl EmbeddedWindowMan { #(#embedded)* }
         impl HostWindowMan { #(#host)* }
-        impl Ctx { #(#focus_context)* }
+        impl Ctx {
+            #(#context_constants)*
+            #(#focus_context)*
+        }
     };
     fs::write(output.join("focus_methods.rs"), focus.to_string())?;
 
     let find_argb_visual = function(x11, "find_argb_visual");
+    let create_host_window = function(x11, "create_host_window");
+    let destroy_host =
+        methods(implementation(x11, "HostWindowMan"), &["destroy"]);
     fs::write(
         output.join("visual_methods.rs"),
-        quote! { #find_argb_visual }.to_string(),
+        quote! {
+            #find_argb_visual
+            #create_host_window
+            impl HostWindowMan { #(#destroy_host)* }
+        }
+        .to_string(),
     )?;
 
     let dragons = module(&parsed.items, "dragons");

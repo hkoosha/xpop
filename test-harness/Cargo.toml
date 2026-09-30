@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+clap = { version = "4.6", features = ["derive"] }
 libc = "0.2"
 x11rb = { version = "0.14", features = ["render"] }
 
@@ -34,3 +35,7 @@ path = "tests/syscalls.rs"
 [[test]]
 name = "visual"
 path = "tests/visual.rs"
+
+[[test]]
+name = "args"
+path = "tests/args.rs"

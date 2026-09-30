@@ -102,6 +102,7 @@ struct Ctx {
     ready: bool,
     discovery: bool,
     handled: Vec<u8>,
+    relaunch_at: Option<std::time::Instant>,
 }
 impl Ctx {
     fn reap_hosted(&mut self) -> Z {
@@ -111,7 +112,7 @@ impl Ctx {
         self.closed = true;
         Ok(())
     }
-    fn discovery_timeout(&self) -> i32 {
+    fn poll_timeout(&self) -> i32 {
         if self.discovery { 0 } else { -1 }
     }
     fn retry_discovery(&mut self) -> Z {
@@ -167,6 +168,7 @@ fn make_ctx() -> Z<(Ctx, UnixStream, UnixStream)> {
         ready: false,
         discovery: false,
         handled: Vec::new(),
+        relaunch_at: None,
     };
     Ok((ctx, x_peer, bus_peer))
 }

@@ -1,12 +1,18 @@
-//! In-memory focus/ownership replay using current production methods.
-//! No X server, rendering, wire protocol, window-manager scheduling, or D-Bus daemon.
+//! In-memory focus/ownership and exit-policy replay using current production methods.
+//! Child processes are native; X11 state is modeled without an X server or D-Bus daemon.
 use std::{
     cell::RefCell,
+    cmp::min,
     collections::VecDeque,
+    fs,
     io,
+    os::unix::process::CommandExt as _,
+    path::PathBuf,
+    process::Command,
     rc::Rc,
     time::{
         Duration,
+        Instant,
         SystemTime,
     },
 };
@@ -111,6 +117,7 @@ struct State {
     parent: Window,
     client_mapped: bool,
     host_mapped: bool,
+    host_destroyed: bool,
     events: VecDeque<Event>,
     focus_requests: Vec<Window>,
     delivered: usize,
@@ -397,6 +404,11 @@ impl HostWindowMan {
         self.x11.get().conn.set_mapped(HOST, false);
         Ok(())
     }
+    fn destroy(&self) -> Z {
+        self.hide()?;
+        self.x11.get().conn.state.borrow_mut().host_destroyed = true;
+        Ok(())
+    }
     fn embed(
         &self,
         _: Window,
@@ -410,7 +422,36 @@ impl HostWindowMan {
         Ok(())
     }
 }
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Behavior {
+    Hide,
+    Appear,
+    None,
+}
+struct Args {
+    command: Vec<String>,
+    working_dir: Option<PathBuf>,
+    on_exit: Behavior,
+}
+#[derive(Debug)]
+enum MyError {
+    NoCommand,
+}
+impl std::fmt::Display for MyError {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.write_str("no command")
+    }
+}
+impl std::error::Error for MyError {}
 struct Ctx {
+    args: Args,
+    process_group: Option<libc::pid_t>,
+    process: Option<EmbeddedProcess>,
+    relaunch_at: Option<Instant>,
+    closed: bool,
     x11: R<X11Host>,
     host: HostWindowMan,
     embedded: EmbeddedWindowMan,
@@ -418,15 +459,9 @@ struct Ctx {
     showing: bool,
     focus_pending: bool,
     last_toggle: SystemTime,
-    window_discovery: Option<()>,
+    window_discovery: Option<Discovery>,
 }
 impl Ctx {
-    const TOGGLE_COOL_DOWN_MILLIS: u128 = 40;
-    fn schedule_discovery(&mut self) {
-        if !self.embedded.is_present() {
-            self.window_discovery = Some(());
-        }
-    }
     fn attach_window(
         &mut self,
         window: Window,
@@ -437,6 +472,14 @@ impl Ctx {
         self.embed(CLIENT)
     }
 }
+impl Drop for Ctx {
+    fn drop(&mut self) {
+        if let Some(hosted) = self.process.as_mut() {
+            let _ = hosted.child.kill();
+            let _ = hosted.child.wait();
+        }
+    }
+}
 fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
     let state = Rc::new(RefCell::new(State {
         focus: OUTSIDE,
@@ -444,6 +487,7 @@ fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
         parent: HOST,
         client_mapped: true,
         host_mapped: true,
+        host_destroyed: false,
         events: VecDeque::new(),
         focus_requests: vec![],
         delivered: 0,
@@ -457,6 +501,15 @@ fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
     });
     let ready = R::of(false);
     let ctx = Ctx {
+        args: Args {
+            command: vec![],
+            working_dir: None,
+            on_exit: Behavior::None,
+        },
+        process_group: None,
+        process: None,
+        relaunch_at: None,
+        closed: false,
         host: HostWindowMan {
             x11: x11.clone(),
             window: HOST,
@@ -742,4 +795,206 @@ fn window_loss_does_not_steal_another_clients_focus() -> Z {
     Ok(())
 }
 
+fn make_hosted_ctx(
+    on_exit: Behavior,
+    showing: bool,
+) -> Z<(Ctx, Rc<RefCell<State>>)> {
+    let (mut ctx, state) = make_ctx();
+    ctx.args.command = vec!["sleep".into(), "60".into()];
+    ctx.args.working_dir = Some(std::env::temp_dir().canonicalize()?);
+    ctx.args.on_exit = on_exit;
+    ctx.showing = showing;
+    ctx.focus_pending = showing;
+    state.borrow_mut().host_mapped = showing;
+    ctx.start()?;
+    ctx.update_readiness()?;
+    ctx.process_x11_events()?;
+    Ok((ctx, state))
+}
+
+fn terminate_hosted(ctx: &mut Ctx) -> Z<u32> {
+    let hosted = ctx.process.as_mut().expect("hosted child is running");
+    let pid = hosted.child.id();
+    hosted.child.kill()?;
+    hosted.child.wait()?;
+    ctx.reap_hosted()?;
+    Ok(pid)
+}
+
+fn finish_pending_relaunch(ctx: &mut Ctx) -> Z {
+    while ctx.process.is_none() {
+        let timeout = ctx.poll_timeout();
+        assert!((1..=500).contains(&timeout));
+        dragons::poll(&mut [], timeout)?;
+        ctx.reap_hosted()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn exit_none_quits_without_relaunch() -> Z {
+    for showing in [false, true] {
+        let (mut ctx, state) = make_hosted_ctx(Behavior::None, showing)?;
+        terminate_hosted(&mut ctx)?;
+        assert!(ctx.closed);
+        assert!(ctx.process.is_none());
+        assert!(state.borrow().host_destroyed);
+        assert!(!state.borrow().host_mapped);
+    }
+    Ok(())
+}
+
+#[test]
+fn exit_policies_relaunch_and_restore_visibility() -> Z {
+    for on_exit in [Behavior::Hide, Behavior::Appear] {
+        for showing in [false, true] {
+            let (mut ctx, state) = make_hosted_ctx(on_exit, showing)?;
+            let presenting = on_exit == Behavior::Appear;
+            for attempt in 0..2 {
+                if attempt == 1 {
+                    // Also exit before a window is found, after discovery backs off.
+                    ctx.embedded.clear();
+                    ctx.ready.write(false);
+                    ctx.window_discovery = Some(Discovery {
+                        deadline: Instant::now() + Ctx::DISCOVERY_MAX_DELAY,
+                        delay: Ctx::DISCOVERY_MAX_DELAY,
+                    });
+                }
+                // A pending toggle cooldown must not suppress the exit policy
+                // or the first user toggle after the replacement is launched.
+                ctx.last_toggle = SystemTime::now() + Duration::from_secs(60);
+                let previous_pid = terminate_hosted(&mut ctx)?;
+                if on_exit == Behavior::Appear {
+                    assert!(ctx.process.is_none());
+                    finish_pending_relaunch(&mut ctx)?;
+                }
+                let hosted =
+                    ctx.process.as_mut().expect("child was relaunched");
+                let pid = hosted.child.id();
+                assert_ne!(pid, previous_pid);
+                assert!(hosted.child.try_wait()?.is_none());
+                assert_eq!(
+                    dragons::pgid(pid as libc::pid_t)?,
+                    pid as libc::pid_t
+                );
+                assert_eq!(ctx.process_group, Some(pid as libc::pid_t));
+                assert_eq!(
+                    fs::read_link(format!("/proc/{pid}/cwd"))?,
+                    *ctx.args.working_dir.as_ref().unwrap()
+                );
+                assert_eq!(
+                    fs::read(format!("/proc/{pid}/cmdline"))?.as_slice(),
+                    b"sleep\x0060\x00"
+                );
+                assert!(!ctx.closed);
+                assert!(!state.borrow().host_destroyed);
+                assert_eq!(state.borrow().host_mapped, presenting);
+                assert_eq!(ctx.showing, presenting);
+                assert_eq!(ctx.focus_pending, presenting);
+                assert!(!ctx.ready.read());
+                assert!(!ctx.embedded.is_present());
+                assert!(ctx.discovery_timeout() > 0);
+                assert!(
+                    ctx.discovery_timeout()
+                        <= Ctx::DISCOVERY_INITIAL_DELAY.as_millis() as i32
+                );
+
+                ctx.retry_discovery()?;
+                ctx.process_x11_events()?;
+                assert_eq!(ctx.ready.read(), presenting);
+                assert_eq!(state.borrow().host_mapped, presenting);
+                assert_eq!(state.borrow().focus == CLIENT, presenting);
+
+                ctx.toggle()?;
+                ctx.process_x11_events()?;
+                assert_eq!(state.borrow().host_mapped, !presenting);
+                assert_eq!(ctx.ready.read(), !presenting);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn exit_appear_waits_half_a_second_before_relaunch() -> Z {
+    let (mut ctx, state) = make_hosted_ctx(Behavior::Appear, true)?;
+    let before_exit = Instant::now();
+    let previous_pid = terminate_hosted(&mut ctx)?;
+    assert!(
+        ctx.process.is_none(),
+        "appear must not relaunch immediately"
+    );
+    assert!(ctx.process_group.is_none());
+    assert!(ctx.window_discovery.is_none());
+    assert!(!ctx.embedded.is_present());
+
+    // A visibility toggle must still work while the replacement is pending.
+    ctx.toggle()?;
+    assert!(!ctx.showing);
+    assert!(!state.borrow().host_mapped);
+    ctx.reap_hosted()?;
+    assert!(ctx.process.is_none());
+
+    finish_pending_relaunch(&mut ctx)?;
+    let hosted = ctx.process.as_mut().expect("child was relaunched");
+    assert_ne!(hosted.child.id(), previous_pid);
+    assert!(hosted.child.try_wait()?.is_none());
+    assert!(before_exit.elapsed() >= Duration::from_millis(500));
+    assert!(!ctx.showing);
+    assert!(!state.borrow().host_mapped);
+    Ok(())
+}
+
+#[test]
+fn quit_cancels_a_pending_appear_relaunch() -> Z {
+    let (mut ctx, state) = make_hosted_ctx(Behavior::Appear, true)?;
+    terminate_hosted(&mut ctx)?;
+    assert!(ctx.process.is_none());
+    ctx.quit()?;
+    std::thread::sleep(Duration::from_millis(500));
+    ctx.reap_hosted()?;
+    assert!(ctx.closed);
+    assert!(ctx.process.is_none());
+    assert!(state.borrow().host_destroyed);
+    Ok(())
+}
+
+#[test]
+fn clean_and_failed_child_exits_obey_policy() -> Z {
+    for on_exit in [Behavior::None, Behavior::Hide, Behavior::Appear] {
+        for code in [0, 7] {
+            let (mut ctx, state) = make_ctx();
+            ctx.args.on_exit = on_exit;
+            ctx.args.command = vec![
+                "sh".into(),
+                "-c".into(),
+                "exit \"$1\"".into(),
+                "hosted-app".into(),
+                code.to_string(),
+            ];
+            ctx.start()?;
+            let hosted = ctx.process.as_mut().unwrap();
+            let pid = hosted.child.id();
+            assert_eq!(hosted.child.wait()?.code(), Some(code));
+            ctx.reap_hosted()?;
+            if on_exit == Behavior::None {
+                assert!(ctx.closed);
+                assert!(ctx.process.is_none());
+                assert!(state.borrow().host_destroyed);
+            }
+            else {
+                finish_pending_relaunch(&mut ctx)?;
+                let hosted =
+                    ctx.process.as_mut().expect("child was relaunched");
+                assert_ne!(hosted.child.id(), pid);
+                assert_eq!(hosted.child.wait()?.code(), Some(code));
+                assert!(!ctx.closed);
+                assert!(!state.borrow().host_destroyed);
+            }
+        }
+    }
+    Ok(())
+}
+
 include!(concat!(env!("OUT_DIR"), "/focus_methods.rs"));
+include!(concat!(env!("OUT_DIR"), "/syscall_methods.rs"));
