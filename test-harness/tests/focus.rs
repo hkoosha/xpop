@@ -3,7 +3,10 @@
 use std::{
     cell::RefCell,
     cmp::min,
-    collections::VecDeque,
+    collections::{
+        HashSet,
+        VecDeque,
+    },
     fs,
     io,
     os::unix::process::CommandExt as _,
@@ -120,6 +123,7 @@ struct State {
     parent: Window,
     client_mapped: bool,
     client_available: bool,
+    client_group: libc::pid_t,
     host_mapped: bool,
     host_destroyed: bool,
     events: VecDeque<Event>,
@@ -175,6 +179,7 @@ impl Checked {
 type FocusReply = GetInputFocusReply;
 struct TreeReply {
     parent: Window,
+    children: Vec<Window>,
 }
 struct Conn {
     state: Rc<RefCell<State>>,
@@ -201,6 +206,47 @@ impl Conn {
             else {
                 ROOT
             },
+            children: {
+                let s = self.state.borrow();
+                let mut children = Vec::new();
+                if window == ROOT {
+                    children.push(HOST);
+                }
+                if window == s.parent && s.client_available {
+                    children.push(CLIENT);
+                }
+                children
+            },
+        }))
+    }
+    fn get_window_attributes(
+        &self,
+        window: Window,
+    ) -> Z<Reply<GetWindowAttributesReply>> {
+        let s = self.state.borrow();
+        let map_state = if window == CLIENT {
+            if !s.client_available {
+                return Err(io::Error::other("client window is missing").into());
+            }
+            if !s.client_mapped {
+                MapState::UNMAPPED
+            }
+            else if s.parent == HOST && !s.host_mapped {
+                MapState::UNVIEWABLE
+            }
+            else {
+                MapState::VIEWABLE
+            }
+        }
+        else if window == HOST && !s.host_mapped {
+            MapState::UNMAPPED
+        }
+        else {
+            MapState::VIEWABLE
+        };
+        Ok(Reply(GetWindowAttributesReply {
+            map_state,
+            ..Default::default()
         }))
     }
     fn set_input_focus(
@@ -293,11 +339,26 @@ impl Conn {
 }
 struct X11Host {
     conn: Conn,
+    root_win: Window,
 }
 struct GrabGuard<'a> {
     _host: &'a X11Host,
 }
 impl X11Host {
+    fn matches_process_group(
+        &self,
+        window: Window,
+        group: libc::pid_t,
+    ) -> Z<bool> {
+        let s = self.conn.state.borrow();
+        Ok(window == CLIENT && s.client_available && s.client_group == group)
+    }
+    fn watch_window(
+        &self,
+        _: Window,
+    ) -> Z {
+        Ok(())
+    }
     fn poll(&self) -> Z<Option<Event>> {
         let mut s = self.conn.state.borrow_mut();
         if s.events.is_empty() {
@@ -348,11 +409,10 @@ impl EmbeddedWindowMan {
         self.embedded_win.is_present()
     }
     fn is_viewable(&self) -> Z<bool> {
-        let x11 = self.x11.get();
-        let s = x11.conn.state.borrow();
-        Ok(self.is_present()
-            && s.client_mapped
-            && (s.parent != HOST || s.host_mapped))
+        if !self.is_present() {
+            return Ok(false);
+        }
+        self.x11.get().is_viewable(CLIENT)
     }
     fn write(
         &self,
@@ -472,22 +532,6 @@ struct Ctx {
     last_toggle: SystemTime,
     window_discovery: Option<Discovery>,
 }
-impl Ctx {
-    fn attach_window(
-        &mut self,
-        window: Window,
-    ) -> Z {
-        if self.process_group.is_some()
-            && self.x11.get().conn.state.borrow().client_available
-        {
-            self.embed(window)?;
-        }
-        Ok(())
-    }
-    fn attach(&mut self) -> Z {
-        self.attach_window(CLIENT)
-    }
-}
 impl Drop for Ctx {
     fn drop(&mut self) {
         if let Some(hosted) = self.process.as_mut() {
@@ -503,6 +547,7 @@ fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
         parent: HOST,
         client_mapped: true,
         client_available: true,
+        client_group: 42,
         host_mapped: true,
         host_destroyed: false,
         events: VecDeque::new(),
@@ -512,6 +557,7 @@ fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
         detached_resizes: 0,
     }));
     let x11 = R::of(X11Host {
+        root_win: ROOT,
         conn: Conn {
             state: state.clone(),
         },
@@ -826,6 +872,7 @@ fn make_hosted_ctx(
     ctx.focus_pending = showing.then_some(OUTSIDE);
     state.borrow_mut().host_mapped = showing;
     ctx.start()?;
+    state.borrow_mut().client_group = ctx.process_group.unwrap();
     ctx.update_readiness()?;
     ctx.process_x11_events()?;
     Ok((ctx, state))
@@ -847,6 +894,8 @@ fn finish_pending_relaunch(ctx: &mut Ctx) -> Z {
         dragons::poll(&mut [], timeout)?;
         ctx.reap_hosted()?;
     }
+    ctx.x11.get().conn.state.borrow_mut().client_group =
+        ctx.process_group.unwrap();
     Ok(())
 }
 
@@ -918,6 +967,13 @@ fn exit_policies_relaunch_and_restore_visibility() -> Z {
                         <= Ctx::DISCOVERY_INITIAL_DELAY.as_millis() as i32
                 );
 
+                // The replacement publishes a newly mapped window belonging
+                // to its new group, not the prior child's hidden window.
+                {
+                    let mut s = state.borrow_mut();
+                    s.client_group = pid as libc::pid_t;
+                    s.client_mapped = true;
+                }
                 ctx.retry_discovery()?;
                 ctx.process_x11_events()?;
                 assert_eq!(ctx.ready.read(), presenting);
@@ -1081,6 +1137,7 @@ fn initial_launch_and_explicit_show_wait_for_a_real_client() -> Z {
             s.host_mapped = false;
         }
         ctx.start()?;
+        state.borrow_mut().client_group = ctx.process_group.unwrap();
         if !initial_show {
             ctx.toggle()?;
         }
@@ -1152,6 +1209,65 @@ fn embedding_preserves_the_focused_client_or_its_descendant() -> Z {
         assert_eq!(state.borrow().focus, focused);
         assert_eq!(state.borrow().revert_to, InputFocus::POINTER_ROOT);
     }
+    Ok(())
+}
+
+#[test]
+fn relaunch_discovers_a_mapped_client_beneath_the_hidden_host() -> Z {
+    for event_driven in [false, true] {
+        let (mut ctx, state) = make_hosted_ctx(Behavior::Appear, true)?;
+        terminate_hosted(&mut ctx)?;
+        finish_pending_relaunch(&mut ctx)?;
+        assert!(!state.borrow().host_mapped);
+        assert!(!ctx.embedded.is_present());
+        assert!(state.borrow().client_mapped);
+        let focus = state.borrow().focus;
+        if event_driven {
+            ctx.attach_window(CLIENT)?;
+        }
+        else {
+            ctx.retry_discovery()?;
+        }
+        ctx.process_x11_events()?;
+        assert!(ctx.embedded.is_present());
+        assert!(state.borrow().host_mapped);
+        assert!(ctx.ready.read());
+        assert!(ctx.window_discovery.is_none());
+        assert_eq!(state.borrow().focus, focus);
+
+        ctx.toggle()?;
+        ctx.last_toggle = SystemTime::UNIX_EPOCH;
+        ctx.toggle()?;
+        ctx.process_x11_events()?;
+        assert!(state.borrow().host_mapped);
+        assert!(ctx.ready.read());
+        assert_eq!(state.borrow().focus, CLIENT);
+    }
+    Ok(())
+}
+
+#[test]
+fn discovery_rejects_unmapped_clients_and_other_process_groups() -> Z {
+    let (mut ctx, state) = make_ctx();
+    ctx.embedded.clear();
+    ctx.schedule_discovery();
+    state.borrow_mut().client_mapped = false;
+    ctx.retry_discovery()?;
+    assert!(!ctx.embedded.is_present());
+    assert!(ctx.window_discovery.is_some());
+    {
+        let mut s = state.borrow_mut();
+        s.client_mapped = true;
+        s.client_group = 43;
+    }
+    ctx.retry_discovery()?;
+    assert!(!ctx.embedded.is_present());
+    assert!(ctx.window_discovery.is_some());
+    state.borrow_mut().client_group = 42;
+    ctx.retry_discovery()?;
+    ctx.process_x11_events()?;
+    assert!(ctx.embedded.is_present());
+    assert!(ctx.ready.read());
     Ok(())
 }
 

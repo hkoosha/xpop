@@ -122,7 +122,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|item| matches!(item, ImplItem::Const(_)));
     let focus_host = methods(
         implementation(x11, "X11Host"),
-        &["input_focus", "contains_window", "focus_window"],
+        &[
+            "input_focus",
+            "contains_window",
+            "focus_window",
+            "find_mapped_window",
+            "is_mapped_window",
+            "is_viewable",
+        ],
     );
     let embedded =
         methods(implementation(x11, "EmbeddedWindowMan"), &["focus"]);
@@ -136,6 +143,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "process_x11_events",
             "process_x11_event",
             "embed",
+            "attach",
+            "attach_window",
             "update_readiness",
             "toggle",
             "start",

@@ -482,9 +482,7 @@ mod x11 {
                     }
 
                     pending.push_back(window);
-                    if self.matches_process_group(window, gid)?
-                        && self.is_viewable(window)?
-                    {
+                    if self.is_mapped_window(window, gid)? {
                         return Ok(Some(window));
                     }
                 }
@@ -508,13 +506,20 @@ mod x11 {
             return Ok(());
         }
 
+        /// A mapped client can be unviewable beneath a hidden ancestor.
+        /// Discovery must accept it; embedding and showing the host make it
+        /// viewable. Focus/readiness checks still require actual viewability.
         pub(crate) fn is_mapped_window(
             &self,
             window: Window,
             gid: libc::pid_t,
         ) -> Z<bool> {
-            return Ok(self.matches_process_group(window, gid)?
-                && self.is_viewable(window)?);
+            if !self.matches_process_group(window, gid)? {
+                return Ok(false);
+            }
+            let state =
+                self.conn.get_window_attributes(window)?.reply()?.map_state;
+            return Ok(state != MapState::UNMAPPED);
         }
 
         pub(crate) fn is_window_pid_property(
@@ -582,6 +587,43 @@ mod x11 {
         }
 
         pub(crate) fn flush(&self) -> Z {
+            self.conn.flush()?;
+            return Ok(());
+        }
+
+        pub(crate) fn input_focus(&self) -> Z<xproto::GetInputFocusReply> {
+            return Ok(self.conn.get_input_focus()?.reply()?);
+        }
+
+        /// Query ancestry while the caller holds a server grab.
+        pub(crate) fn contains_window(
+            &self,
+            ancestor: Window,
+            mut window: Window,
+        ) -> Z<bool> {
+            while window > u32::from(InputFocus::POINTER_ROOT) {
+                if window == ancestor {
+                    return Ok(true);
+                }
+                if self.root_is(window) {
+                    break;
+                }
+                window = self.conn.query_tree(window)?.reply()?.parent;
+            }
+            return Ok(false);
+        }
+
+        pub(crate) fn focus_window(
+            &self,
+            window: Window,
+        ) -> Z {
+            self.conn
+                .set_input_focus(
+                    InputFocus::POINTER_ROOT,
+                    window,
+                    x11rb::CURRENT_TIME,
+                )?
+                .check()?;
             self.conn.flush()?;
             return Ok(());
         }
@@ -686,7 +728,11 @@ mod x11 {
         /// RevertToParent becomes RevertToNone after reverting to the host. If
         /// the host then disappears, X discards keyboard input. PointerRoot
         /// avoids this cascade without either process having to run cleanup.
-        pub(crate) fn focus(&self) -> Z<bool> {
+        /// The supplied reply must be queried under the same server grab.
+        pub(crate) fn focus(
+            &self,
+            focus: xproto::GetInputFocusReply,
+        ) -> Z<bool> {
             let Some(window) = *self.embedded_win.read()
             else {
                 log!(embedded@warn "no embedded window, cannot focus");
@@ -699,7 +745,6 @@ mod x11 {
                 return Ok(false);
             }
 
-            let focus = self.x11.get().conn.get_input_focus()?.reply()?;
             if self.is(focus.focus)
                 && focus.revert_to == InputFocus::POINTER_ROOT
             {
@@ -707,17 +752,7 @@ mod x11 {
                 return Ok(true);
             }
 
-            self.x11
-                .get()
-                .conn
-                .set_input_focus(
-                    InputFocus::POINTER_ROOT,
-                    window,
-                    x11rb::CURRENT_TIME,
-                )?
-                .check()?;
-
-            self.x11.get().conn.flush()?;
+            self.x11.get().focus_window(window)?;
 
             Ok(true)
         }
@@ -757,23 +792,23 @@ mod x11 {
         }
 
         pub(crate) fn hide(&self) -> Z {
-            self.x11.get().conn.unmap_window(self.window)?.check()?;
-            self.x11.get().conn.flush()?;
+            let x11 = self.x11.get();
+            let server_grab = x11.grab_server()?;
+            self.release_focus()?;
+            x11.conn.unmap_window(self.window)?.check()?;
+            drop(server_grab);
+            x11.conn.flush()?;
             return Ok(());
         }
 
-        /// Keep PointerRoot reversion if xpop exits before a client is attached.
-        pub(crate) fn focus(&self) -> Z {
-            self.x11
-                .get()
-                .conn
-                .set_input_focus(
-                    InputFocus::POINTER_ROOT,
-                    self.window,
-                    x11rb::CURRENT_TIME,
-                )?
-                .check()?;
-            self.x11.get().conn.flush()?;
+        /// Called with the server grabbed so focus ownership cannot change
+        /// between the query, release, and unmapping of this host.
+        fn release_focus(&self) -> Z {
+            let x11 = self.x11.get();
+            let focused = x11.input_focus()?.focus;
+            if x11.contains_window(self.window, focused)? {
+                x11.focus_window(u32::from(InputFocus::POINTER_ROOT))?;
+            }
             return Ok(());
         }
 
@@ -1081,7 +1116,10 @@ mod app {
         },
         message::MatchRule,
     };
-    use x11rb::protocol::Event;
+    use x11rb::protocol::{
+        Event,
+        xproto::Window,
+    };
 
     use crate::x11::{
         EmbeddedWindowMan,
@@ -1125,7 +1163,7 @@ mod app {
         dbus: DBusConn,
         signal_rule: MatchRule<'static>,
         showing: bool,
-        focus_pending: bool,
+        focus_pending: Option<Window>,
         closed: bool,
         last_toggle: SystemTime,
         window_discovery: Option<Discovery>,
@@ -1284,8 +1322,12 @@ mod app {
                             == x11rb::protocol::xproto::NotifyMode::NORMAL
                         && self.host.is_focused()?
                     {
-                        self.focus_pending = true;
+                        self.focus_pending = Some(event.event);
                         self.update_readiness()?;
+                        if !self.ready.read() {
+                            self.host.hide()?;
+                            self.focus_pending = None;
+                        }
                     }
                 }
 
@@ -1329,6 +1371,8 @@ mod app {
                         "embedded X11 window was destroyed: {:#x}",
                         event.window
                     );
+                    self.host.hide()?;
+                    self.focus_pending = None;
                     self.ready.write(false);
                     self.embedded.clear();
                     self.schedule_discovery();
@@ -1341,11 +1385,6 @@ mod app {
         }
 
         fn start(&mut self) -> Z {
-            if self.showing {
-                self.host.show()?;
-                self.host.focus()?;
-            }
-
             let mut it = Command::new(
                 self.args.command.first().ok_or(MyError::NoCommand)?,
             );
@@ -1418,6 +1457,8 @@ mod app {
             &mut self,
             status: std::process::ExitStatus,
         ) -> Z {
+            self.host.hide()?;
+            self.focus_pending = None;
             if let Some(hosted) = self.process.take() {
                 log!(ctx@info
                     "hosted process exited status, pid={}, status={}",
@@ -1435,13 +1476,9 @@ mod app {
             self.process_group = None;
             self.window_discovery = None;
             self.showing = self.args.on_exit == Behavior::Appear;
-            self.focus_pending = self.showing;
             self.last_toggle = SystemTime::UNIX_EPOCH;
 
-            if !self.showing {
-                self.host.hide()?;
-            }
-            else {
+            if self.showing {
                 self.relaunch_at = Some(Instant::now() + Self::RELAUNCH_DELAY);
                 return Ok(());
             }
@@ -1545,33 +1582,56 @@ mod app {
         ) -> Z {
             let x11 = self.x11.get();
             let server_grab = x11.grab_server()?;
+            let focused = x11.input_focus()?.focus;
+            let had_focus = x11.contains_window(window, focused)?;
             self.host.embed(window)?;
             self.embedded.write(window);
             self.embedded.resize(*self.host.area())?;
             self.embedded.map_window()?;
+            if self.showing {
+                self.host.show()?;
+                if had_focus {
+                    // Unmap/reparent must not discard an existing client or
+                    // descendant focus. Restore only that already-owned focus.
+                    x11.focus_window(focused)?;
+                    self.focus_pending = None;
+                }
+            }
 
             drop(server_grab);
             x11.flush()?;
             drop(x11);
 
             self.window_discovery = None;
-            self.focus_pending = self.showing;
             return self.update_readiness();
         }
 
-        /// Clear focus intent only after a successful or already-satisfied request.
-        /// Never focus the host here: its FocusIn would trigger another handoff.
+        /// A pending handoff belongs to the focus observed when it was requested.
+        /// Do not replay it after the user has switched to another application.
         fn update_readiness(&mut self) -> Z {
             self.ready.write(self.embedded.is_viewable()?);
-
-            if self.ready.read()
-                && self.showing
-                && self.focus_pending
-                && self.embedded.focus()?
-            {
-                self.focus_pending = false;
+            if !self.ready.read() || !self.showing {
+                return Ok(());
             }
+            let Some(expected) = self.focus_pending
+            else {
+                return Ok(());
+            };
 
+            let x11 = self.x11.get();
+            let server_grab = x11.grab_server()?;
+            let focused = x11.input_focus()?;
+            if focused.focus != expected
+                && !self.host.is(focused.focus)
+                && !self.embedded.is(focused.focus)
+            {
+                self.focus_pending = None;
+            }
+            else if self.embedded.focus(focused)? {
+                self.focus_pending = None;
+            }
+            drop(server_grab);
+            x11.flush()?;
             return Ok(());
         }
 
@@ -1587,24 +1647,25 @@ mod app {
             self.last_toggle = now;
 
             self.showing = !self.showing;
-            self.focus_pending = self.showing;
+            self.focus_pending = None;
 
             if !self.showing {
                 self.ready.write(false);
-                self.embedded.hide()?;
-                self.host.hide()
+                self.host.hide()?;
+                self.embedded.hide()
             }
             else {
-                self.host.show()?;
+                self.focus_pending = Some(self.x11.get().input_focus()?.focus);
                 if !self.embedded.is_present() {
                     self.attach()?;
                 }
                 if self.embedded.is_present() {
+                    self.host.show()?;
                     self.embedded.map_window()?;
                     self.update_readiness()
                 }
                 else {
-                    self.host.focus()
+                    Ok(())
                 }
             }
         }
@@ -1615,6 +1676,8 @@ mod app {
             }
             self.closed = true;
             self.relaunch_at = None;
+            self.focus_pending = None;
+            self.host.hide()?;
 
             if let Some(hosted) = self.process.take() {
                 dragons::try_kill_group(hosted.gid);
@@ -1680,7 +1743,12 @@ mod app {
             embedded: open_embed_man(x11.clone(), ready.clone()),
 
             showing: args.on_start == Behavior::Appear,
-            focus_pending: args.on_start == Behavior::Appear,
+            focus_pending: if args.on_start == Behavior::Appear {
+                Some(x11.get().input_focus()?.focus)
+            }
+            else {
+                None
+            },
 
             last_toggle: SystemTime::UNIX_EPOCH,
             process_group: None,
