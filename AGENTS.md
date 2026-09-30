@@ -23,6 +23,7 @@ is in `src/main.rs`, using `x11rb`/XCB, `dbus`, and small native Linux helpers.
 - Avoid unnecessary allocation, repeated X11 round trips, and polling work in
   the event loop. Correctness comes first, but a fix that creates a hot loop is
   not a fix.
+- Do NOT update the README.md unless asked to.
 
 ## Development environment: no display testing
 
