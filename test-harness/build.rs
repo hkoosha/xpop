@@ -120,11 +120,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .items
         .iter()
         .filter(|item| matches!(item, ImplItem::Const(_)));
+    let focus_host = methods(
+        implementation(x11, "X11Host"),
+        &["input_focus", "contains_window", "focus_window"],
+    );
     let embedded =
         methods(implementation(x11, "EmbeddedWindowMan"), &["focus"]);
     let host = methods(
         implementation(x11, "HostWindowMan"),
-        &["focus", "is_focused", "is_parent_of"],
+        &["hide", "release_focus", "is_focused", "is_parent_of"],
     );
     let focus_context = methods(
         context,
@@ -146,6 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let focus = quote! {
         #(#lifecycle_types)*
+        impl X11Host { #(#focus_host)* }
         impl EmbeddedWindowMan { #(#embedded)* }
         impl HostWindowMan { #(#host)* }
         impl Ctx {

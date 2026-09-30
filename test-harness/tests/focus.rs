@@ -18,7 +18,10 @@ use std::{
 };
 use x11rb::protocol::{
     Event,
-    xproto::*,
+    xproto::{
+        self,
+        *,
+    },
 };
 type Z<T = ()> = Result<T, Box<dyn std::error::Error>>;
 macro_rules! log {
@@ -116,6 +119,7 @@ struct State {
     revert_to: InputFocus,
     parent: Window,
     client_mapped: bool,
+    client_available: bool,
     host_mapped: bool,
     host_destroyed: bool,
     events: VecDeque<Event>,
@@ -168,10 +172,7 @@ impl Checked {
         }
     }
 }
-struct FocusReply {
-    focus: Window,
-    revert_to: InputFocus,
-}
+type FocusReply = GetInputFocusReply;
 struct TreeReply {
     parent: Window,
 }
@@ -183,6 +184,7 @@ impl Conn {
         Ok(Reply(FocusReply {
             focus: self.state.borrow().focus,
             revert_to: self.state.borrow().revert_to,
+            ..Default::default()
         }))
     }
     fn query_tree(
@@ -192,6 +194,9 @@ impl Conn {
         Ok(Reply(TreeReply {
             parent: if window == CLIENT {
                 self.state.borrow().parent
+            }
+            else if window == CLIENT + 1 {
+                CLIENT
             }
             else {
                 ROOT
@@ -234,6 +239,13 @@ impl Conn {
     fn flush(&self) -> Z {
         Ok(())
     }
+    fn unmap_window(
+        &self,
+        window: Window,
+    ) -> Z<Checked> {
+        self.set_mapped(window, false);
+        Ok(Checked(false))
+    }
     fn set_mapped(
         &self,
         window: Window,
@@ -270,7 +282,10 @@ impl Conn {
         s.events.push_back(event);
         if !value
             && (s.focus == window
-                || (window == HOST && s.focus == CLIENT && s.parent == HOST))
+                || (window == CLIENT && s.focus == CLIENT + 1)
+                || (window == HOST
+                    && (s.focus == CLIENT || s.focus == CLIENT + 1)
+                    && s.parent == HOST))
         {
             s.revert_focus();
         }
@@ -400,10 +415,6 @@ impl HostWindowMan {
         self.x11.get().conn.set_mapped(HOST, true);
         Ok(())
     }
-    fn hide(&self) -> Z {
-        self.x11.get().conn.set_mapped(HOST, false);
-        Ok(())
-    }
     fn destroy(&self) -> Z {
         self.hide()?;
         self.x11.get().conn.state.borrow_mut().host_destroyed = true;
@@ -457,7 +468,7 @@ struct Ctx {
     embedded: EmbeddedWindowMan,
     ready: R<bool>,
     showing: bool,
-    focus_pending: bool,
+    focus_pending: Option<Window>,
     last_toggle: SystemTime,
     window_discovery: Option<Discovery>,
 }
@@ -466,10 +477,15 @@ impl Ctx {
         &mut self,
         window: Window,
     ) -> Z {
-        self.embed(window)
+        if self.process_group.is_some()
+            && self.x11.get().conn.state.borrow().client_available
+        {
+            self.embed(window)?;
+        }
+        Ok(())
     }
     fn attach(&mut self) -> Z {
-        self.embed(CLIENT)
+        self.attach_window(CLIENT)
     }
 }
 impl Drop for Ctx {
@@ -486,6 +502,7 @@ fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
         revert_to: InputFocus::NONE,
         parent: HOST,
         client_mapped: true,
+        client_available: true,
         host_mapped: true,
         host_destroyed: false,
         events: VecDeque::new(),
@@ -506,7 +523,7 @@ fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
             working_dir: None,
             on_exit: Behavior::None,
         },
-        process_group: None,
+        process_group: Some(42),
         process: None,
         relaunch_at: None,
         closed: false,
@@ -529,7 +546,7 @@ fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
         x11,
         ready,
         showing: true,
-        focus_pending: true,
+        focus_pending: Some(OUTSIDE),
         last_toggle: SystemTime::UNIX_EPOCH,
         window_discovery: None,
     };
@@ -566,7 +583,7 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
             Ok(s.focus == CLIENT
                 && s.focus_requests == [CLIENT]
                 && s.events.is_empty()
-                && !ctx.focus_pending)
+                && ctx.focus_pending.is_none())
         },
     );
     scenario(
@@ -574,13 +591,13 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
         &mut failures,
         || {
             let (mut ctx, state) = make_ctx();
-            ctx.focus_pending = false;
+            ctx.focus_pending = None;
             state.borrow_mut().focus = CLIENT;
             state.borrow_mut().events.push_back(mapped(CLIENT, HOST));
             ctx.process_x11_events()?;
             Ok(state.borrow().focus == CLIENT
                 && state.borrow().focus_requests.is_empty()
-                && !ctx.focus_pending)
+                && ctx.focus_pending.is_none())
         },
     );
     scenario(
@@ -588,7 +605,7 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
         &mut failures,
         || {
             let (mut ctx, state) = make_ctx();
-            ctx.focus_pending = false;
+            ctx.focus_pending = None;
             state.borrow_mut().focus = HOST;
             state
                 .borrow_mut()
@@ -597,7 +614,7 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
             ctx.process_x11_events()?;
             Ok(state.borrow().focus == CLIENT
                 && state.borrow().focus_requests == [CLIENT]
-                && !ctx.focus_pending)
+                && ctx.focus_pending.is_none())
         },
     );
     for (name, focus, mode) in [
@@ -619,13 +636,13 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
     ] {
         scenario(name, &mut failures, || {
             let (mut ctx, state) = make_ctx();
-            ctx.focus_pending = false;
+            ctx.focus_pending = None;
             state.borrow_mut().focus = focus;
             state.borrow_mut().events.push_back(focus_in(mode));
             ctx.process_x11_events()?;
             Ok(state.borrow().focus == focus
                 && state.borrow().focus_requests.is_empty()
-                && !ctx.focus_pending)
+                && ctx.focus_pending.is_none())
         });
     }
     scenario(
@@ -633,7 +650,7 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
         &mut failures,
         || {
             let (mut ctx, state) = make_ctx();
-            ctx.focus_pending = false;
+            ctx.focus_pending = None;
             state.borrow_mut().focus = CLIENT;
             ctx.toggle()?;
             ctx.last_toggle = SystemTime::UNIX_EPOCH;
@@ -641,9 +658,8 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
             ctx.process_x11_events()?;
             Ok(ctx.showing
                 && ctx.ready.read()
-                && !ctx.focus_pending
-                && state.borrow().focus == CLIENT
-                && state.borrow().focus_requests == [CLIENT])
+                && ctx.focus_pending.is_none()
+                && state.borrow().focus == CLIENT)
         },
     );
     scenario(
@@ -654,7 +670,7 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
             state.borrow_mut().client_mapped = false;
             ctx.update_readiness()?;
             if ctx.ready.read()
-                || !ctx.focus_pending
+                || ctx.focus_pending.is_none()
                 || !state.borrow().focus_requests.is_empty()
             {
                 return Ok(false);
@@ -662,7 +678,7 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
             ctx.embedded.map_window()?;
             ctx.process_x11_events()?;
             Ok(ctx.ready.read()
-                && !ctx.focus_pending
+                && ctx.focus_pending.is_none()
                 && state.borrow().focus == CLIENT)
         },
     );
@@ -672,13 +688,13 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
         || {
             let (mut ctx, state) = make_ctx();
             state.borrow_mut().fail_focus = true;
-            if ctx.update_readiness().is_ok() || !ctx.focus_pending {
+            if ctx.update_readiness().is_ok() || ctx.focus_pending.is_none() {
                 return Ok(false);
             }
             state.borrow_mut().fail_focus = false;
             ctx.update_readiness()?;
             ctx.process_x11_events()?;
-            Ok(!ctx.focus_pending && state.borrow().focus == CLIENT)
+            Ok(ctx.focus_pending.is_none() && state.borrow().focus == CLIENT)
         },
     );
     scenario(
@@ -686,7 +702,7 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
         &mut failures,
         || {
             let (mut ctx, state) = make_ctx();
-            ctx.focus_pending = false;
+            ctx.focus_pending = None;
             ctx.ready.write(true);
             state.borrow_mut().parent = ROOT;
             ctx.process_x11_event(reparented(ROOT))?;
@@ -702,9 +718,8 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
             Ok(ctx.embedded.is_present()
                 && ctx.ready.read()
                 && ctx.window_discovery.is_none()
-                && !ctx.focus_pending
+                && ctx.focus_pending.is_none()
                 && s.parent == HOST
-                && s.focus == CLIENT
                 && s.detached_resizes == 0)
         },
     );
@@ -713,7 +728,7 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
         &mut failures,
         || {
             let (mut ctx, state) = make_ctx();
-            ctx.focus_pending = false;
+            ctx.focus_pending = None;
             ctx.ready.write(true);
             ctx.process_x11_event(reparented(ROOT))?;
             Ok(ctx.embedded.is_present()
@@ -735,7 +750,7 @@ fn focus_events_converge_and_preserve_user_focus() -> Z {
 fn client_and_host_loss_cannot_discard_keyboard_focus() -> Z {
     for order in [[CLIENT, HOST], [HOST, CLIENT]] {
         let (ctx, state) = make_ctx();
-        assert!(ctx.embedded.focus()?);
+        assert!(ctx.embedded.focus(ctx.x11.get().input_focus()?)?);
         let mut focus_after_loss = [0; 2];
         for (index, window) in order.into_iter().enumerate() {
             // Destruction/disconnection makes the window and its descendants
@@ -760,7 +775,7 @@ fn already_focused_client_still_arms_safe_reversion() -> Z {
         s.focus = CLIENT;
         s.revert_to = InputFocus::PARENT;
     }
-    assert!(ctx.embedded.focus()?);
+    assert!(ctx.embedded.focus(ctx.x11.get().input_focus()?)?);
     ctx.x11.get().conn.set_mapped(CLIENT, false);
     ctx.x11.get().conn.set_mapped(HOST, false);
     assert_eq!(state.borrow().focus, u32::from(InputFocus::POINTER_ROOT));
@@ -768,13 +783,17 @@ fn already_focused_client_still_arms_safe_reversion() -> Z {
 }
 
 #[test]
-fn host_loss_before_embedding_cannot_discard_keyboard_focus() -> Z {
-    let (ctx, state) = make_ctx();
+fn quitting_an_empty_host_with_unsafe_reversion_keeps_keyboard_input() -> Z {
+    let (mut ctx, state) = make_ctx();
     ctx.embedded.clear();
-    ctx.x11.get().conn.set_mapped(CLIENT, false);
-    ctx.host.focus()?;
-    ctx.x11.get().conn.set_mapped(HOST, false);
+    {
+        let mut s = state.borrow_mut();
+        s.focus = HOST;
+        s.revert_to = InputFocus::NONE;
+    }
+    ctx.quit()?;
     assert_eq!(state.borrow().focus, u32::from(InputFocus::POINTER_ROOT));
+    assert!(state.borrow().host_destroyed);
     Ok(())
 }
 
@@ -782,7 +801,7 @@ fn host_loss_before_embedding_cannot_discard_keyboard_focus() -> Z {
 fn window_loss_does_not_steal_another_clients_focus() -> Z {
     for order in [[CLIENT, HOST], [HOST, CLIENT]] {
         let (ctx, state) = make_ctx();
-        assert!(ctx.embedded.focus()?);
+        assert!(ctx.embedded.focus(ctx.x11.get().input_focus()?)?);
         let x11 = ctx.x11.get();
         x11.conn
             .set_input_focus(InputFocus::PARENT, OUTSIDE, x11rb::CURRENT_TIME)?
@@ -804,7 +823,7 @@ fn make_hosted_ctx(
     ctx.args.working_dir = Some(std::env::temp_dir().canonicalize()?);
     ctx.args.on_exit = on_exit;
     ctx.showing = showing;
-    ctx.focus_pending = showing;
+    ctx.focus_pending = showing.then_some(OUTSIDE);
     state.borrow_mut().host_mapped = showing;
     ctx.start()?;
     ctx.update_readiness()?;
@@ -888,9 +907,9 @@ fn exit_policies_relaunch_and_restore_visibility() -> Z {
                 );
                 assert!(!ctx.closed);
                 assert!(!state.borrow().host_destroyed);
-                assert_eq!(state.borrow().host_mapped, presenting);
+                assert!(!state.borrow().host_mapped);
                 assert_eq!(ctx.showing, presenting);
-                assert_eq!(ctx.focus_pending, presenting);
+                assert!(ctx.focus_pending.is_none());
                 assert!(!ctx.ready.read());
                 assert!(!ctx.embedded.is_present());
                 assert!(ctx.discovery_timeout() > 0);
@@ -903,7 +922,7 @@ fn exit_policies_relaunch_and_restore_visibility() -> Z {
                 ctx.process_x11_events()?;
                 assert_eq!(ctx.ready.read(), presenting);
                 assert_eq!(state.borrow().host_mapped, presenting);
-                assert_eq!(state.borrow().focus == CLIENT, presenting);
+                assert_ne!(state.borrow().focus, CLIENT);
 
                 ctx.toggle()?;
                 ctx.process_x11_events()?;
@@ -992,6 +1011,146 @@ fn clean_and_failed_child_exits_obey_policy() -> Z {
                 assert!(!state.borrow().host_destroyed);
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn automatic_relaunch_preserves_another_hosts_keyboard_focus() -> Z {
+    let (mut ctx, state) = make_hosted_ctx(Behavior::Appear, true)?;
+    // OUTSIDE can be another xpop, not just a conventional WM-managed app.
+    state.borrow_mut().focus = OUTSIDE;
+    terminate_hosted(&mut ctx)?;
+    finish_pending_relaunch(&mut ctx)?;
+    assert_eq!(state.borrow().focus, OUTSIDE);
+    assert!(!state.borrow().host_mapped);
+    ctx.retry_discovery()?;
+    ctx.process_x11_events()?;
+    assert!(state.borrow().host_mapped);
+    assert_eq!(state.borrow().focus, OUTSIDE);
+
+    let replacement = ctx.process.as_ref().unwrap().child.id();
+    for _ in 0..8 {
+        ctx.reap_hosted()?;
+        ctx.process_x11_events()?;
+        assert_eq!(ctx.process.as_ref().unwrap().child.id(), replacement);
+        assert_eq!(state.borrow().focus, OUTSIDE);
+    }
+    Ok(())
+}
+
+#[test]
+fn child_exit_releases_focus_that_reverted_to_an_empty_host() -> Z {
+    let (mut ctx, state) = make_hosted_ctx(Behavior::Appear, true)?;
+    // An application can replace xpop's reversion policy with RevertToParent.
+    // Its destruction then focuses the host with the next reversion set to None.
+    {
+        let mut s = state.borrow_mut();
+        s.focus = HOST;
+        s.revert_to = InputFocus::NONE;
+    }
+    terminate_hosted(&mut ctx)?;
+    assert_eq!(state.borrow().focus, u32::from(InputFocus::POINTER_ROOT));
+    assert!(!state.borrow().host_mapped);
+    Ok(())
+}
+
+#[test]
+fn late_readiness_does_not_steal_focus_after_the_user_switches_apps() -> Z {
+    let (mut ctx, state) = make_ctx();
+    state.borrow_mut().client_mapped = false;
+    ctx.update_readiness()?;
+    state.borrow_mut().focus = OUTSIDE + 1;
+    ctx.embedded.map_window()?;
+    ctx.process_x11_events()?;
+    assert_eq!(state.borrow().focus, OUTSIDE + 1);
+    Ok(())
+}
+
+#[test]
+fn initial_launch_and_explicit_show_wait_for_a_real_client() -> Z {
+    for initial_show in [false, true] {
+        let (mut ctx, state) = make_ctx();
+        ctx.args.command = vec!["sleep".into(), "60".into()];
+        ctx.embedded.clear();
+        ctx.showing = initial_show;
+        ctx.focus_pending = initial_show.then_some(OUTSIDE);
+        {
+            let mut s = state.borrow_mut();
+            s.client_available = false;
+            s.host_mapped = false;
+        }
+        ctx.start()?;
+        if !initial_show {
+            ctx.toggle()?;
+        }
+        assert!(ctx.showing);
+        assert!(!state.borrow().host_mapped);
+        assert_eq!(state.borrow().focus, OUTSIDE);
+
+        state.borrow_mut().client_available = true;
+        ctx.retry_discovery()?;
+        ctx.process_x11_events()?;
+        assert!(state.borrow().host_mapped);
+        assert_eq!(state.borrow().focus, CLIENT);
+    }
+    Ok(())
+}
+
+#[test]
+fn hiding_releases_only_focus_owned_by_this_hosts_window_tree() -> Z {
+    for focused in [HOST, CLIENT, CLIENT + 1, OUTSIDE] {
+        let (ctx, state) = make_ctx();
+        {
+            let mut s = state.borrow_mut();
+            s.focus = focused;
+            s.revert_to = InputFocus::NONE;
+        }
+        ctx.host.hide()?;
+        let expected = if focused == OUTSIDE {
+            OUTSIDE
+        }
+        else {
+            u32::from(InputFocus::POINTER_ROOT)
+        };
+        assert_eq!(state.borrow().focus, expected);
+        assert!(!state.borrow().host_mapped);
+    }
+    Ok(())
+}
+
+#[test]
+fn focus_handoff_to_an_empty_host_does_not_trap_keyboard_input() -> Z {
+    let (mut ctx, state) = make_ctx();
+    ctx.embedded.clear();
+    {
+        let mut s = state.borrow_mut();
+        s.focus = HOST;
+        s.revert_to = InputFocus::NONE;
+    }
+    ctx.process_x11_event(focus_in(NotifyMode::NORMAL))?;
+    assert_eq!(state.borrow().focus, u32::from(InputFocus::POINTER_ROOT));
+    assert!(!state.borrow().host_mapped);
+    Ok(())
+}
+
+#[test]
+fn embedding_preserves_the_focused_client_or_its_descendant() -> Z {
+    for focused in [CLIENT, CLIENT + 1] {
+        let (mut ctx, state) = make_ctx();
+        ctx.embedded.clear();
+        {
+            let mut s = state.borrow_mut();
+            s.parent = ROOT;
+            s.focus = focused;
+            s.revert_to = InputFocus::POINTER_ROOT;
+            s.host_mapped = false;
+        }
+        ctx.embed(CLIENT)?;
+        ctx.process_x11_events()?;
+        assert!(ctx.ready.read());
+        assert_eq!(state.borrow().focus, focused);
+        assert_eq!(state.borrow().revert_to, InputFocus::POINTER_ROOT);
     }
     Ok(())
 }
