@@ -4,6 +4,7 @@ use std::{
     cell::RefCell,
     cmp::min,
     collections::{
+        HashMap,
         HashSet,
         VecDeque,
     },
@@ -36,6 +37,7 @@ const ROOT: Window = 0x10;
 const HOST: Window = 0x100;
 const CLIENT: Window = 0x200;
 const OUTSIDE: Window = 0x300;
+const OTHER_HOST: Window = 0x400;
 struct R<T>(Rc<RefCell<T>>);
 impl<T> Clone for R<T> {
     fn clone(&self) -> Self {
@@ -117,6 +119,17 @@ fn reparented(parent: Window) -> Event {
     })
 }
 // In-memory event/ownership model; no X connection, X server, or D-Bus daemon.
+struct ModelWindow {
+    parent: Window,
+    mapped: bool,
+}
+struct ButtonGrab {
+    owner_events: bool,
+    pointer_mode: GrabMode,
+    keyboard_mode: GrabMode,
+    event_mask: EventMask,
+}
+
 struct State {
     focus: Window,
     revert_to: InputFocus,
@@ -131,8 +144,97 @@ struct State {
     delivered: usize,
     fail_focus: bool,
     detached_resizes: usize,
+    other_windows: HashMap<Window, ModelWindow>,
+    button_grabs: HashMap<Window, ButtonGrab>,
+    frozen_press: Option<ButtonPressEvent>,
+    client_presses: Vec<(Window, u8)>,
 }
 impl State {
+    fn parent_of(
+        &self,
+        window: Window,
+    ) -> Window {
+        if window == CLIENT {
+            self.parent
+        }
+        else if window == CLIENT + 1 {
+            CLIENT
+        }
+        else {
+            self.other_windows.get(&window).map_or(ROOT, |it| it.parent)
+        }
+    }
+    fn mapped(
+        &self,
+        window: Window,
+    ) -> bool {
+        if window == HOST {
+            self.host_mapped
+        }
+        else if window == CLIENT {
+            self.client_mapped
+        }
+        else {
+            self.other_windows.get(&window).is_none_or(|it| it.mapped)
+        }
+    }
+    fn contains(
+        &self,
+        ancestor: Window,
+        mut window: Window,
+    ) -> bool {
+        while window > 1 && window != ROOT {
+            if window == ancestor {
+                return true;
+            }
+            window = self.parent_of(window);
+        }
+        false
+    }
+    fn viewable(
+        &self,
+        mut window: Window,
+    ) -> bool {
+        while window > 1 && window != ROOT {
+            if !self.mapped(window) {
+                return false;
+            }
+            window = self.parent_of(window);
+        }
+        true
+    }
+    fn press(
+        &mut self,
+        host: Window,
+        client: Window,
+        detail: u8,
+        time: u32,
+    ) -> ButtonPressEvent {
+        let grab = self.button_grabs.get(&host).unwrap();
+        assert!(!grab.owner_events);
+        assert!(grab.event_mask.contains(EventMask::BUTTON_PRESS));
+        assert_eq!(grab.pointer_mode, GrabMode::SYNC);
+        assert!(self.viewable(client));
+        let event = ButtonPressEvent {
+            response_type: BUTTON_PRESS_EVENT,
+            event: host,
+            child: client,
+            detail,
+            time,
+            ..Default::default()
+        };
+        self.frozen_press = Some(event);
+        event
+    }
+    fn keyboard_target(&self) -> Option<Window> {
+        if let Some(event) = self.frozen_press {
+            if self.button_grabs[&event.event].keyboard_mode == GrabMode::SYNC {
+                return None;
+            }
+        }
+        (self.focus > 1 && self.viewable(self.focus)).then_some(self.focus)
+    }
+
     // XSetInputFocus: losing a viewable focus window applies revert_to.
     // RevertToParent also resets the next reversion to RevertToNone.
     // https://www.x.org/archive/current/doc/man/man3/XSetInputFocus.3.xhtml
@@ -140,15 +242,11 @@ impl State {
         self.focus = match self.revert_to {
             InputFocus::PARENT => {
                 self.revert_to = InputFocus::NONE;
-                if self.focus == CLIENT
-                    && self.parent == HOST
-                    && self.host_mapped
-                {
-                    HOST
+                let mut parent = self.parent_of(self.focus);
+                while parent != ROOT && !self.viewable(parent) {
+                    parent = self.parent_of(parent);
                 }
-                else {
-                    ROOT
-                }
+                parent
             }
             InputFocus::POINTER_ROOT => u32::from(InputFocus::POINTER_ROOT),
             InputFocus::NONE => x11rb::NONE,
@@ -197,15 +295,7 @@ impl Conn {
         window: Window,
     ) -> Z<Reply<TreeReply>> {
         Ok(Reply(TreeReply {
-            parent: if window == CLIENT {
-                self.state.borrow().parent
-            }
-            else if window == CLIENT + 1 {
-                CLIENT
-            }
-            else {
-                ROOT
-            },
+            parent: self.state.borrow().parent_of(window),
             children: {
                 let s = self.state.borrow();
                 let mut children = Vec::new();
@@ -215,6 +305,9 @@ impl Conn {
                 if window == s.parent && s.client_available {
                     children.push(CLIENT);
                 }
+                children.extend(s.other_windows.iter().filter_map(
+                    |(&id, it)| (it.parent == window).then_some(id),
+                ));
                 children
             },
         }))
@@ -224,22 +317,14 @@ impl Conn {
         window: Window,
     ) -> Z<Reply<GetWindowAttributesReply>> {
         let s = self.state.borrow();
-        let map_state = if window == CLIENT {
-            if !s.client_available {
-                return Err(io::Error::other("client window is missing").into());
-            }
-            if !s.client_mapped {
-                MapState::UNMAPPED
-            }
-            else if s.parent == HOST && !s.host_mapped {
-                MapState::UNVIEWABLE
-            }
-            else {
-                MapState::VIEWABLE
-            }
+        if window == CLIENT && !s.client_available {
+            return Err(io::Error::other("client window is missing").into());
         }
-        else if window == HOST && !s.host_mapped {
+        let map_state = if !s.mapped(window) {
             MapState::UNMAPPED
+        }
+        else if !s.viewable(window) {
+            MapState::UNVIEWABLE
         }
         else {
             MapState::VIEWABLE
@@ -266,19 +351,78 @@ impl Conn {
             return Ok(Checked(false));
         }
         s.focus = window;
-        if old == HOST {
+        if old == HOST || old == OTHER_HOST {
             s.events.push_back(Event::FocusOut(FocusInEvent {
                 response_type: FOCUS_OUT_EVENT,
-                event: HOST,
+                event: old,
                 mode: NotifyMode::NORMAL,
                 detail: NotifyDetail::INFERIOR,
                 ..Default::default()
             }));
         }
-        if window == HOST
-            || (window == CLIENT && s.parent == HOST && old != HOST)
-        {
-            s.events.push_back(focus_in(NotifyMode::NORMAL));
+        let host = if s.contains(HOST, window) {
+            Some(HOST)
+        }
+        else if s.contains(OTHER_HOST, window) {
+            Some(OTHER_HOST)
+        }
+        else {
+            None
+        };
+        if let Some(host) = host {
+            s.events.push_back(Event::FocusIn(FocusInEvent {
+                response_type: FOCUS_IN_EVENT,
+                event: host,
+                mode: NotifyMode::NORMAL,
+                detail: if window == host {
+                    NotifyDetail::NONLINEAR
+                }
+                else {
+                    NotifyDetail::INFERIOR
+                },
+                ..Default::default()
+            }));
+        }
+        Ok(Checked(false))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn grab_button(
+        &self,
+        owner_events: bool,
+        window: Window,
+        event_mask: EventMask,
+        pointer_mode: GrabMode,
+        keyboard_mode: GrabMode,
+        _: Window,
+        _: u32,
+        _: ButtonIndex,
+        _: ModMask,
+    ) -> Z<Checked> {
+        self.state.borrow_mut().button_grabs.insert(
+            window,
+            ButtonGrab {
+                owner_events,
+                pointer_mode,
+                keyboard_mode,
+                event_mask,
+            },
+        );
+        Ok(Checked(false))
+    }
+    fn allow_events(
+        &self,
+        mode: Allow,
+        time: u32,
+    ) -> Z<Checked> {
+        let mut s = self.state.borrow_mut();
+        if mode != Allow::REPLAY_POINTER {
+            return Err(io::Error::other("unsupported replay mode").into());
+        }
+        if let Some(event) = s.frozen_press {
+            if time == x11rb::CURRENT_TIME || time >= event.time {
+                s.frozen_press = None;
+                s.client_presses.push((event.child, event.detail));
+            }
         }
         Ok(Checked(false))
     }
@@ -298,22 +442,20 @@ impl Conn {
         value: bool,
     ) {
         let mut s = self.state.borrow_mut();
-        let old = if window == HOST {
-            s.host_mapped
-        }
-        else {
-            s.client_mapped
-        };
+        let old = s.mapped(window);
         if old == value {
             return;
         }
         if window == HOST {
             s.host_mapped = value;
         }
-        else {
+        else if window == CLIENT {
             s.client_mapped = value;
         }
-        let parent = if window == HOST { ROOT } else { s.parent };
+        else {
+            s.other_windows.get_mut(&window).unwrap().mapped = value;
+        }
+        let parent = s.parent_of(window);
         let event = if value {
             mapped(window, parent)
         }
@@ -326,13 +468,7 @@ impl Conn {
             })
         };
         s.events.push_back(event);
-        if !value
-            && (s.focus == window
-                || (window == CLIENT && s.focus == CLIENT + 1)
-                || (window == HOST
-                    && (s.focus == CLIENT || s.focus == CLIENT + 1)
-                    && s.parent == HOST))
-        {
+        if !value && s.contains(window, s.focus) {
             s.revert_focus();
         }
     }
@@ -340,6 +476,7 @@ impl Conn {
 struct X11Host {
     conn: Conn,
     root_win: Window,
+    host_win: Window,
 }
 struct GrabGuard<'a> {
     _host: &'a X11Host,
@@ -361,9 +498,24 @@ impl X11Host {
     }
     fn poll(&self) -> Z<Option<Event>> {
         let mut s = self.conn.state.borrow_mut();
-        if s.events.is_empty() {
+        let Some(index) = s.events.iter().position(|event| match event {
+            Event::FocusIn(event) | Event::FocusOut(event) => {
+                event.event == self.host_win
+            }
+            Event::MapNotify(event) => {
+                event.window == self.host_win
+                    || s.contains(self.host_win, event.window)
+            }
+            Event::UnmapNotify(event) => {
+                event.window == self.host_win
+                    || s.contains(self.host_win, event.window)
+            }
+            Event::ReparentNotify(event) => event.parent == self.host_win,
+            _ => true,
+        })
+        else {
             return Ok(None);
-        }
+        };
         s.delivered += 1;
         // Replay safety bound only: production event draining has no cap.
         if s.delivered > 64 {
@@ -372,7 +524,7 @@ impl X11Host {
             )
             .into());
         }
-        Ok(s.events.pop_front())
+        Ok(s.events.remove(index))
     }
     fn root_is(
         &self,
@@ -409,10 +561,11 @@ impl EmbeddedWindowMan {
         self.embedded_win.is_present()
     }
     fn is_viewable(&self) -> Z<bool> {
-        if !self.is_present() {
+        let Some(window) = *self.embedded_win.read()
+        else {
             return Ok(false);
-        }
-        self.x11.get().is_viewable(CLIENT)
+        };
+        self.x11.get().is_viewable(window)
     }
     fn write(
         &self,
@@ -427,24 +580,24 @@ impl EmbeddedWindowMan {
         &self,
         _: Area,
     ) -> Z {
-        if self.is_present() {
+        if let Some(window) = *self.embedded_win.read() {
             let x11 = self.x11.get();
             let mut s = x11.conn.state.borrow_mut();
-            if s.parent != HOST {
+            if s.parent_of(window) != x11.host_win {
                 s.detached_resizes += 1;
             }
         }
         Ok(())
     }
     fn map_window(&self) -> Z {
-        if self.is_present() {
-            self.x11.get().conn.set_mapped(CLIENT, true);
+        if let Some(window) = *self.embedded_win.read() {
+            self.x11.get().conn.set_mapped(window, true);
         }
         Ok(())
     }
     fn hide(&self) -> Z {
-        if self.is_present() {
-            self.x11.get().conn.set_mapped(CLIENT, false);
+        if let Some(window) = *self.embedded_win.read() {
+            self.x11.get().conn.set_mapped(window, false);
         }
         Ok(())
     }
@@ -472,7 +625,7 @@ impl HostWindowMan {
         self.area = area;
     }
     fn show(&self) -> Z {
-        self.x11.get().conn.set_mapped(HOST, true);
+        self.x11.get().conn.set_mapped(self.window, true);
         Ok(())
     }
     fn destroy(&self) -> Z {
@@ -482,13 +635,25 @@ impl HostWindowMan {
     }
     fn embed(
         &self,
-        _: Window,
+        window: Window,
     ) -> Z {
         let x11 = self.x11.get();
-        x11.conn.set_mapped(CLIENT, false);
+        x11.conn.set_mapped(window, false);
         let mut s = x11.conn.state.borrow_mut();
-        s.parent = HOST;
-        s.events.push_back(reparented(HOST));
+        if window == CLIENT {
+            s.parent = self.window;
+        }
+        else {
+            s.other_windows.get_mut(&window).unwrap().parent = self.window;
+        }
+        s.events
+            .push_back(Event::ReparentNotify(ReparentNotifyEvent {
+                response_type: REPARENT_NOTIFY_EVENT,
+                event: window,
+                window,
+                parent: self.window,
+                ..Default::default()
+            }));
         self.ready.write(false);
         Ok(())
     }
@@ -555,9 +720,14 @@ fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
         delivered: 0,
         fail_focus: false,
         detached_resizes: 0,
+        other_windows: HashMap::new(),
+        button_grabs: HashMap::new(),
+        frozen_press: None,
+        client_presses: Vec::new(),
     }));
     let x11 = R::of(X11Host {
         root_win: ROOT,
+        host_win: HOST,
         conn: Conn {
             state: state.clone(),
         },
@@ -596,8 +766,47 @@ fn make_ctx() -> (Ctx, Rc<RefCell<State>>) {
         last_toggle: SystemTime::UNIX_EPOCH,
         window_discovery: None,
     };
+    ctx.host.enable_click_focus().unwrap();
     (ctx, state)
 }
+fn make_two_ctxs() -> (Ctx, Ctx, Rc<RefCell<State>>) {
+    let (first, state) = make_ctx();
+    let (mut second, _) = make_ctx();
+    {
+        let mut s = state.borrow_mut();
+        s.other_windows.insert(
+            OTHER_HOST,
+            ModelWindow {
+                parent: ROOT,
+                mapped: false,
+            },
+        );
+        s.other_windows.insert(
+            OUTSIDE,
+            ModelWindow {
+                parent: ROOT,
+                mapped: true,
+            },
+        );
+        s.focus = CLIENT;
+        s.revert_to = InputFocus::POINTER_ROOT;
+    }
+    second.x11 = R::of(X11Host {
+        root_win: ROOT,
+        host_win: OTHER_HOST,
+        conn: Conn {
+            state: state.clone(),
+        },
+    });
+    second.host.x11 = second.x11.clone();
+    second.host.window = OTHER_HOST;
+    second.embedded.x11 = second.x11.clone();
+    second.embedded.clear();
+    second.focus_pending = Some(CLIENT);
+    second.host.enable_click_focus().unwrap();
+    (first, second, state)
+}
+
 fn scenario(
     name: &str,
     failures: &mut usize,
@@ -1268,6 +1477,88 @@ fn discovery_rejects_unmapped_clients_and_other_process_groups() -> Z {
     ctx.process_x11_events()?;
     assert!(ctx.embedded.is_present());
     assert!(ctx.ready.read());
+    Ok(())
+}
+
+#[test]
+fn initial_focus_survives_neutral_reversion_while_the_client_starts() -> Z {
+    for focused in [x11rb::NONE, u32::from(InputFocus::POINTER_ROOT)] {
+        let (mut ctx, state) = make_ctx();
+        // OUTSIDE represents the first host's client at second-instance launch.
+        ctx.embedded.clear();
+        state.borrow_mut().parent = ROOT;
+        state.borrow_mut().host_mapped = false;
+        state.borrow_mut().focus = focused;
+        ctx.embed(CLIENT)?;
+        ctx.process_x11_events()?;
+        assert!(ctx.ready.read());
+        assert_eq!(state.borrow().focus, CLIENT);
+        assert!(ctx.focus_pending.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn clicking_the_second_host_hands_off_keyboard_focus() -> Z {
+    let (mut ctx, state) = make_ctx();
+    ctx.focus_pending = None;
+    state.borrow_mut().focus = OUTSIDE;
+    let event = state.borrow_mut().press(HOST, CLIENT, 1, 123);
+    assert_eq!(state.borrow().keyboard_target(), Some(OUTSIDE));
+    ctx.process_x11_event(Event::ButtonPress(event))?;
+    assert_eq!(state.borrow().focus, CLIENT);
+    assert_eq!(state.borrow().revert_to, InputFocus::POINTER_ROOT);
+    ctx.process_x11_events()?;
+    assert_eq!(state.borrow().focus, CLIENT);
+    assert!(state.borrow().frozen_press.is_none());
+    assert_eq!(state.borrow().client_presses, [(CLIENT, 1)]);
+    Ok(())
+}
+
+#[test]
+fn two_hosts_can_exchange_keyboard_focus_without_fighting() -> Z {
+    let (mut first, mut second, state) = make_two_ctxs();
+    first.focus_pending = None;
+    second.embed(OUTSIDE)?;
+    first.process_x11_events()?;
+    second.process_x11_events()?;
+    assert_eq!(state.borrow().keyboard_target(), Some(OUTSIDE));
+
+    for (host, client, time) in
+        [(HOST, CLIENT, 200), (OTHER_HOST, OUTSIDE, 300)]
+    {
+        let event = state.borrow_mut().press(host, client, 1, time);
+        if host == HOST {
+            first.process_x11_event(Event::ButtonPress(event))?;
+        }
+        else {
+            second.process_x11_event(Event::ButtonPress(event))?;
+        }
+        first.process_x11_events()?;
+        second.process_x11_events()?;
+        assert_eq!(state.borrow().keyboard_target(), Some(client));
+        assert!(state.borrow().frozen_press.is_none());
+        assert_eq!(state.borrow().revert_to, InputFocus::POINTER_ROOT);
+    }
+    assert_eq!(state.borrow().client_presses, [(CLIENT, 1), (OUTSIDE, 1)]);
+    first.host.hide()?;
+    assert_eq!(state.borrow().keyboard_target(), Some(OUTSIDE));
+    second.host.hide()?;
+    assert_eq!(state.borrow().focus, u32::from(InputFocus::POINTER_ROOT));
+    Ok(())
+}
+
+#[test]
+fn rejected_click_focus_replays_the_press_without_freezing_keyboard() -> Z {
+    let (mut ctx, state) = make_ctx();
+    ctx.focus_pending = None;
+    state.borrow_mut().fail_focus = true;
+    let event = state.borrow_mut().press(HOST, CLIENT, 1, 123);
+    assert_eq!(state.borrow().keyboard_target(), Some(OUTSIDE));
+    assert!(ctx.process_x11_event(Event::ButtonPress(event)).is_err());
+    assert_eq!(state.borrow().keyboard_target(), Some(OUTSIDE));
+    assert!(state.borrow().frozen_press.is_none());
+    assert_eq!(state.borrow().client_presses, [(CLIENT, 1)]);
     Ok(())
 }
 

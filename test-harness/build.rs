@@ -126,6 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "input_focus",
             "contains_window",
             "focus_window",
+            "replay_click",
             "find_mapped_window",
             "is_mapped_window",
             "is_viewable",
@@ -135,7 +136,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         methods(implementation(x11, "EmbeddedWindowMan"), &["focus"]);
     let host = methods(
         implementation(x11, "HostWindowMan"),
-        &["hide", "release_focus", "is_focused", "is_parent_of"],
+        &[
+            "hide",
+            "release_focus",
+            "is_focused",
+            "is_parent_of",
+            "enable_click_focus",
+        ],
     );
     let focus_context = methods(
         context,

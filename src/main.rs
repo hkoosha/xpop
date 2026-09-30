@@ -628,6 +628,17 @@ mod x11 {
             return Ok(());
         }
 
+        pub(crate) fn replay_click(
+            &self,
+            time: xproto::Timestamp,
+        ) -> Z {
+            self.conn
+                .allow_events(xproto::Allow::REPLAY_POINTER, time)?
+                .check()?;
+            self.conn.flush()?;
+            return Ok(());
+        }
+
         pub(crate) fn root_is(
             &self,
             window: Window,
@@ -771,6 +782,28 @@ mod x11 {
     }
 
     impl HostWindowMan {
+        /// Override-redirect hosts have no WM click-to-focus handler. Intercept
+        /// a press, keep keyboard processing asynchronous, then replay the press
+        /// to the client after the focus handoff (including on focus failure).
+        pub(crate) fn enable_click_focus(&self) -> Z {
+            let x11 = self.x11.get();
+            x11.conn
+                .grab_button(
+                    false,
+                    self.window,
+                    EventMask::BUTTON_PRESS,
+                    xproto::GrabMode::SYNC,
+                    xproto::GrabMode::ASYNC,
+                    x11rb::NONE,
+                    x11rb::NONE,
+                    xproto::ButtonIndex::ANY,
+                    xproto::ModMask::ANY,
+                )?
+                .check()?;
+            x11.conn.flush()?;
+            return Ok(());
+        }
+
         pub(crate) fn set_host_area(
             &mut self,
             area: Area,
@@ -1075,6 +1108,7 @@ mod x11 {
             area,
             ready,
         };
+        this.enable_click_focus()?;
 
         return Ok(this);
     }
@@ -1273,6 +1307,21 @@ mod app {
             log!(ekran "x11 event: {:?}", event);
 
             match event {
+                Event::ButtonPress(event) if self.host.is(event.event) => {
+                    let focus_result = (|| -> Z {
+                        if self.showing && self.embedded.is_viewable()? {
+                            self.focus_pending =
+                                Some(self.x11.get().input_focus()?.focus);
+                            self.update_readiness()?;
+                        }
+                        return Ok(());
+                    })();
+                    // A failed handoff must not leave pointer events frozen.
+                    let replay_result = self.x11.get().replay_click(event.time);
+                    focus_result?;
+                    replay_result?;
+                }
+
                 Event::MapNotify(event)
                     if self.x11.get().root_is(event.event)
                         && !self.host.is(event.window)
@@ -1608,6 +1657,7 @@ mod app {
 
         /// A pending handoff belongs to the focus observed when it was requested.
         /// Do not replay it after the user has switched to another application.
+        /// None/PointerRoot is neutral server reversion, not a different app.
         fn update_readiness(&mut self) -> Z {
             self.ready.write(self.embedded.is_viewable()?);
             if !self.ready.read() || !self.showing {
@@ -1622,6 +1672,10 @@ mod app {
             let server_grab = x11.grab_server()?;
             let focused = x11.input_focus()?;
             if focused.focus != expected
+                && focused.focus
+                    > u32::from(
+                        x11rb::protocol::xproto::InputFocus::POINTER_ROOT,
+                    )
                 && !self.host.is(focused.focus)
                 && !self.embedded.is(focused.focus)
             {
