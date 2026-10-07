@@ -35,6 +35,9 @@ install: release
     -g root -o root \
     ./target/release/xpop /usr/bin/xpop
 
+test: fmt
+  cargo test
+
 exe-help: (run '-h')
 exe-xterm: (run 'xterm')
 

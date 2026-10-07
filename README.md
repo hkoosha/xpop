@@ -1,7 +1,12 @@
 # xpop
 
-Host an X11 application in a pull-down window and toggle its visibility over
-D-Bus.
+Toggle an X11 application's pull-down visibility over D-Bus.
+
+xpop keeps the application as its own normal top-level X11 window. It applies
+the requested geometry once when the application is discovered, then uses
+direct `UnmapWindow` / `MapWindow` calls to hide and restore it. It does not
+reparent the application or resize it while toggling, preserving the window
+manager's ownership and the application's dimensions.
 
 Successor to https://crates.io/crates/zoha for hosting a pull-down terminal in
 XOrg.
