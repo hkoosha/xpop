@@ -67,3 +67,16 @@ Options:
   -h, --help                     Print help
 ```
 
+## Catch
+
+xpop cannot prevent a newly launched application from being shown briefly.
+Xorg does not offer a way for another process to launch a client window hidden:
+the application creates and maps its own window, and its window manager may
+show it before xpop can discover it and apply its hints.
+
+To avoid this launch flicker, use an application-specific hidden/minimized
+startup option, or configure a window-manager rule matching the application's
+class or title to hide, minimize, or otherwise place the window before it is
+shown. If you control the application, create its window unmapped and only map
+it after your controller signals it.
+

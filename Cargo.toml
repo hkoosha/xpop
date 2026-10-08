@@ -1,6 +1,6 @@
 [package]
 name = "xpop"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 authors = ["Koosha Hosseiny <git@koosha.io>"]
 description = "An X11 pull-down application toggler"
