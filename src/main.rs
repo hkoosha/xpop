@@ -50,7 +50,10 @@ use x11rb::xcb_ffi::XCBConnection;
 use crate::poly::*;
 
 const TOGGLE_COOL_DOWN_MILLIS: u128 = 40;
-const LAUNCH_WAIT: Duration = Duration::from_millis(200);
+const LAUNCH_WAIT_MAX_MILLIS: u64 = 200;
+const LAUNCH_WAIT_MILLIS: u64 = 5;
+const LAUNCH_WAIT_RETRIES: u64 = LAUNCH_WAIT_MAX_MILLIS / LAUNCH_WAIT_MILLIS;
+const LAUNCH_HIDE_RETRIES: u64 = LAUNCH_WAIT_RETRIES * 2;
 const NAMESPACE: &str = "io.koosha.xpop";
 const PATH: &str = "/io/koosha/xpop";
 const METHOD: &str = "pop";
@@ -178,6 +181,9 @@ enum MyError {
 
     #[error("missing window: {0}")]
     MissingWindow(String),
+
+    #[error("window not ready to hide: {0}")]
+    WindowNotReady(String),
 
     #[error("app launch error")]
     AppLaunch(#[from] std::io::Error),
@@ -529,10 +535,40 @@ impl WindowMan {
                 thread::spawn(move || {
                     let _ = child.wait();
                 });
-                thread::sleep(LAUNCH_WAIT);
+
+                let mut window = None;
+                for _ in 0..LAUNCH_WAIT_RETRIES {
+                    thread::sleep(Duration::from_millis(LAUNCH_WAIT_MILLIS));
+                    match self.find_window() {
+                        Ok(it) => {
+                            window = Some(it);
+                            break;
+                        }
+                        Err(MyError::MissingWindow(_)) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                let window = window
+                    .ok_or_else(|| MyError::MissingWindow(err.clone()))?;
+
+                log!(man@trac "hiding newly launched window so its WM hints will properly apply: {}={}", bin, window);
+                let x11 = self.conn.get();
+                let mut ready_to_hide = false;
+                for _ in 0..LAUNCH_HIDE_RETRIES {
+                    if x11.get_window_attributes(window)?.reply()?.map_state
+                        == MapState::VIEWABLE
+                    {
+                        ready_to_hide = true;
+                        break;
+                    }
+                }
+                if !ready_to_hide {
+                    return Err(MyError::WindowNotReady(err));
+                }
+                self.hide(window)?;
 
                 cmd = Cmd::Show;
-                self.find_window()?
+                window
             }
             Err(err) => return Err(err),
         };

@@ -31,9 +31,7 @@ release:
   ls -lh target/release/xpop
 
 install: release
-  sudo install -v \
-    -g root -o root \
-    ./target/release/xpop /usr/bin/xpop
+  cargo install --path .
 
 test: fmt
   cargo test
