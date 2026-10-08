@@ -24,7 +24,9 @@ use std::time::{
 };
 
 use clap::{
+    Args as ClapArgs,
     Parser,
+    Subcommand,
     ValueEnum,
 };
 use dbus::MethodErr;
@@ -845,11 +847,13 @@ fn window_properties(
 }
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(author, version, about, subcommand_required = true)]
 struct Args {
     #[arg(
-        short,
+        short = 'v',
         long,
+        global = true,
+        help_heading = "Global options",
         action = clap::ArgAction::Count
     )]
     verbose: u8,
@@ -858,64 +862,89 @@ struct Args {
     #[arg(
         short,
         long,
+        global = true,
+        help_heading = "Global options",
         value_parser = Self::parse_dbus_ns
     )]
     namespace: Option<String>,
 
-    /// top left x coordinate, absolute pixels or percentage of screen width.
+    #[command(subcommand)]
+    mode: Mode,
+}
+
+#[derive(Debug, Subcommand)]
+enum Mode {
+    /// Run the D-Bus daemon.
+    #[command(visible_alias = "d")]
+    Daemon(DaemonArgs),
+
+    /// Send a command to the daemon for an X11 window.
+    #[command(visible_alias = "s")]
+    Signal(SignalArgs),
+
+    /// List reusable filters for X11 client windows.
+    #[command(visible_alias = "l")]
+    List(ListArgs),
+}
+
+#[derive(Debug, ClapArgs, Default)]
+struct DaemonArgs {
+    /// bin-to-path mapping in the form NAME=PATH.
+    #[arg(short, long, value_name = "BIN=PATH")]
+    bin: Vec<String>,
+}
+
+#[derive(Debug, ClapArgs)]
+struct SignalArgs {
+    /// Top-left x coordinate, in absolute pixels or percentage of screen width.
     #[arg(short)]
     x: Option<String>,
 
-    /// top left y coordinate, absolute pixels or percentage of screen width.
+    /// Top-left y coordinate, in absolute pixels or percentage of screen height.
     #[arg(short)]
     y: Option<String>,
 
-    /// width, absolute pixels or percentage of screen width.
+    /// Width, in absolute pixels or percentage of screen width.
     #[arg(short)]
     w: Option<String>,
 
-    /// height, absolute pixels or percentage of screen height.
+    /// Height, in absolute pixels or percentage of screen height.
     #[arg(short)]
     r: Option<String>,
 
-    /// List a reusable filter for each X11 client window. Optionally restrict
-    /// each line to a comma-separated list of id, class, and title.
-    #[arg(
-        short,
-        long,
-        num_args = 0..,
-        value_delimiter = ',',
-        conflicts_with_all = ["command", "filter", "bin"]
-    )]
-    list: Option<Vec<ListProperty>>,
+    #[command(subcommand)]
+    command: SignalCommand,
+}
 
-    /// If specified, will send a command via dbus instead of launching a server
-    #[arg(
-        short,
-        long,
-        requires = "filter",
-        conflicts_with_all = ["list", "bin"]
-    )]
-    command: Option<Cmd>,
+#[derive(Debug, Subcommand)]
+enum SignalCommand {
+    Show(FilterArgs),
+    Hide(FilterArgs),
+    Toggle(FilterArgs),
+}
 
-    /// Window to operate on
-    #[arg(
-        short,
-        long,
-        requires = "command",
-        value_parser = WindowFilter::from_str,
-        conflicts_with_all = ["list", "bin"]
-    )]
-    filter: Option<WindowFilter>,
+#[derive(Debug, ClapArgs)]
+struct FilterArgs {
+    /// Window filter.
+    #[arg(value_name = "FILTER", value_parser = WindowFilter::from_str)]
+    filter: WindowFilter,
+}
 
-    /// bin-to-path mapping in the form NAME=PATH.
-    #[arg(
-        short,
-        long,
-        value_name = "BIN=PATH",
-        conflicts_with_all = ["command", "list"]
-    )]
-    bin: Vec<String>,
+impl SignalCommand {
+    fn into_parts(self) -> (Cmd, WindowFilter) {
+        return match self {
+            Self::Show(args) => (Cmd::Show, args.filter),
+            Self::Hide(args) => (Cmd::Hide, args.filter),
+            Self::Toggle(args) => (Cmd::Toggle, args.filter),
+        };
+    }
+}
+
+#[derive(Debug, ClapArgs)]
+struct ListArgs {
+    /// Add a property to each listed filter. May be passed multiple times.
+    #[arg(short, long)]
+    list: Vec<ListProperty>,
 }
 
 impl Args {
@@ -957,13 +986,15 @@ impl Args {
         }
         return Ok(());
     }
+}
 
+impl DaemonArgs {
     fn bin_mappings(&self) -> Z<HashMap<String, PathBuf>> {
         let mut bins = HashMap::with_capacity(self.bin.len());
         for bin in &self.bin {
             let (name, path) =
                 bin.split_once('=').ok_or(MyError::InvalidArg("bin"))?;
-            Self::parse_bin_name(name)?;
+            Args::parse_bin_name(name)?;
 
             let path = PathBuf::from(path);
             if path.as_os_str().is_empty()
@@ -1170,13 +1201,16 @@ fn ekran_dbus(
     return Ok(());
 }
 
-fn ekran_server(args: Args) -> Z {
-    let bins = args.bin_mappings()?;
+fn ekran_daemon(
+    namespace: String,
+    daemon: DaemonArgs,
+) -> Z {
+    let bins = daemon.bin_mappings()?;
     let (tx, rx) = mpsc::channel();
 
     let join_x11 = thread::spawn(move || ekran_x11(rx, bins));
 
-    let dbus_result = ekran_dbus(args.dbus_namespace(), tx);
+    let dbus_result = ekran_dbus(namespace, tx);
 
     log!(main "signaling end");
     LOOP.store(false, Ordering::SeqCst);
@@ -1196,7 +1230,10 @@ fn ekran_server(args: Args) -> Z {
     return Ok(());
 }
 
-fn ekran_client(args: Args) -> Z {
+fn ekran_client(
+    namespace: String,
+    signal: SignalArgs,
+) -> Z {
     fn normalize<T: FromStr + Display>(
         name: &'static str,
         v: Option<String>,
@@ -1212,16 +1249,15 @@ fn ekran_client(args: Args) -> Z {
         };
     }
 
-    let namespace = args.dbus_namespace();
     let area = format!(
         "{},{},{},{}",
-        normalize::<i16>("x", args.x)?,
-        normalize::<i16>("y", args.y)?,
-        normalize::<u16>("w", args.w)?,
-        normalize::<u16>("h", args.r)?
+        normalize::<i16>("x", signal.x)?,
+        normalize::<i16>("y", signal.y)?,
+        normalize::<u16>("w", signal.w)?,
+        normalize::<u16>("h", signal.r)?
     );
-    let mut filter = args.filter.unwrap();
-    let command = args.command.unwrap().as_ref().to_string();
+    let (command, mut filter) = signal.command.into_parts();
+    let command = command.as_ref().to_string();
     let bin = filter.fallback.take().unwrap_or_default();
 
     let dbus_args = (filter.to_string(), command, area, bin);
@@ -1248,14 +1284,11 @@ fn main() -> Result<(), MyError> {
         TRACE.store(true, Ordering::SeqCst);
     }
     log!(main "BEGIN");
+    let namespace = args.dbus_namespace();
 
-    return if let Some(properties) = args.list.as_deref() {
-        ekran_list(properties)
-    }
-    else if args.command.is_some() {
-        ekran_client(args)
-    }
-    else {
-        ekran_server(args)
+    return match args.mode {
+        Mode::Daemon(daemon) => ekran_daemon(namespace, daemon),
+        Mode::Signal(signal) => ekran_client(namespace, signal),
+        Mode::List(list) => ekran_list(&list.list),
     };
 }
