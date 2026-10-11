@@ -38,8 +38,10 @@ use x11rb::protocol::xproto::{
     self,
     Atom,
     AtomEnum,
+    ClientMessageEvent,
     ConfigureWindowAux,
     ConnectionExt as _,
+    EventMask,
     MapState,
     Screen,
     Window,
@@ -54,6 +56,9 @@ const LAUNCH_WAIT_MAX_MILLIS: u64 = 200;
 const LAUNCH_WAIT_MILLIS: u64 = 5;
 const LAUNCH_WAIT_RETRIES: u64 = LAUNCH_WAIT_MAX_MILLIS / LAUNCH_WAIT_MILLIS;
 const LAUNCH_HIDE_RETRIES: u64 = LAUNCH_WAIT_RETRIES * 2;
+const EWMH_GRAVITY_NORTH_WEST: u32 = 1;
+const EWMH_MOVE_RESIZE_ALL: u32 = 0b1111;
+const EWMH_SOURCE_NORMAL_APPLICATION: u32 = 1;
 const NAMESPACE: &str = "io.koosha.xpop";
 const PATH: &str = "/io/koosha/xpop";
 const METHOD: &str = "pop";
@@ -327,6 +332,7 @@ struct Atoms {
     net_wm_state_sticky: Atom,
     net_wm_state_skip_taskbar: Atom,
     net_wm_state_skip_pager: Atom,
+    net_moveresize_window: Atom,
     net_wm_name: Atom,
 }
 
@@ -380,6 +386,70 @@ impl WindowMan {
         return Ok(());
     }
 
+    fn wait_until_viewable(
+        &self,
+        x11: &XCBConnection,
+        window: Window,
+    ) -> Z {
+        for _ in 0..LAUNCH_HIDE_RETRIES {
+            if x11.get_window_attributes(window)?.reply()?.map_state
+                == MapState::VIEWABLE
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(LAUNCH_WAIT_MILLIS));
+        }
+
+        return Err(MyError::WindowNotReady(self.window_desc.clone()));
+    }
+
+    fn place_mapped_window(
+        &self,
+        x11: &XCBConnection,
+        window: Window,
+        area: Area,
+    ) -> Z {
+        // Some WMs replace a pre-map ConfigureWindow request with their own
+        // initial placement. Repeat it after the client is managed, as GTK's
+        // GtkWindow::move_ does.
+        x11.configure_window(
+            window,
+            &ConfigureWindowAux::new()
+                .x(area.x)
+                .y(area.y)
+                .height(area.h)
+                .width(area.w),
+        )?
+        .check()?;
+
+        // _NET_MOVERESIZE_WINDOW expresses the same root-relative geometry to
+        // EWMH-aware WMs, avoiding client/frame-relative coordinates.
+        let flags = EWMH_GRAVITY_NORTH_WEST
+            | (EWMH_MOVE_RESIZE_ALL << 8)
+            | (EWMH_SOURCE_NORMAL_APPLICATION << 12);
+        let event = ClientMessageEvent::new(
+            32,
+            window,
+            self.atoms.net_moveresize_window,
+            [
+                flags,
+                area.x as u32,
+                area.y as u32,
+                area.w,
+                area.h,
+            ],
+        );
+        x11.send_event(
+            false,
+            self.screen.root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )?
+        .check()?;
+
+        return Ok(());
+    }
+
     fn show(
         &self,
         window: Window,
@@ -403,6 +473,10 @@ impl WindowMan {
         .check()?;
 
         x11.map_window(window)?.check()?;
+        x11.flush()?;
+
+        self.wait_until_viewable(&x11, window)?;
+        self.place_mapped_window(&x11, window, area)?;
 
         self.apply_dropdown_hints(&x11, window)?;
 
@@ -553,18 +627,8 @@ impl WindowMan {
 
                 log!(man@trac "hiding newly launched window so its WM hints will properly apply: {}={}", bin, window);
                 let x11 = self.conn.get();
-                let mut ready_to_hide = false;
-                for _ in 0..LAUNCH_HIDE_RETRIES {
-                    if x11.get_window_attributes(window)?.reply()?.map_state
-                        == MapState::VIEWABLE
-                    {
-                        ready_to_hide = true;
-                        break;
-                    }
-                }
-                if !ready_to_hide {
-                    return Err(MyError::WindowNotReady(err));
-                }
+                self.wait_until_viewable(&x11, window)
+                    .map_err(|_| MyError::WindowNotReady(err))?;
                 self.hide(window)?;
 
                 cmd = Cmd::Show;
@@ -1120,6 +1184,7 @@ fn ekran_x11(
         net_wm_state_sticky: atom_intern(b"_NET_WM_STATE_STICKY")?,
         net_wm_state_skip_taskbar: atom_intern(b"_NET_WM_STATE_SKIP_TASKBAR")?,
         net_wm_state_skip_pager: atom_intern(b"_NET_WM_STATE_SKIP_PAGER")?,
+        net_moveresize_window: atom_intern(b"_NET_MOVERESIZE_WINDOW")?,
         net_wm_name: atom_intern(b"_NET_WM_NAME")?,
     };
 
